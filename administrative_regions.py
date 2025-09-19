@@ -15,6 +15,7 @@ Robust AdministrativeRegions:
     find_best_city(name, province_name=None) -> Optional[str]
     find_best_district(name, city_name=None) -> Optional[str]
     find_best_village(name, district_name=None) -> Optional[str]
+    find_anywhere(text) -> Dict[str, Optional[str]]   # whole-text fallback resolver
 """
 
 from __future__ import annotations
@@ -231,7 +232,7 @@ class AdministrativeRegions:
         return []
 
     # ----------------------------
-    # Single-best resolvers (use these in your parser)
+    # Single-best resolvers
     # ----------------------------
     def find_best_province(self, name: str) -> Optional[str]:
         pid = self._best_key_by_value(self.provinces, name, level="province", cutoff=0.60)
@@ -302,3 +303,114 @@ class AdministrativeRegions:
                 if sc > best_score:
                     best_name, best_score = vill_map[vid], sc
         return best_name
+
+    # ----------------------------
+    # Whole-text fallback resolver
+    # ----------------------------
+    def find_anywhere(self, text: str) -> Dict[str, Optional[str]]:
+        """
+        Aggressively guess Province -> City -> District -> Village from a free-form page text.
+        Uses the same OCR-aware comparators but searches across all levels.
+        """
+        result: Dict = {"Provinsi": None, "Kota": None, "Kecamatan": None, "Kel_Desa": None}
+        if not text:
+            return result
+
+        # Province
+        best_prov, best_p = None, 0.0
+        for pid, pname in self.provinces.items():
+            sc = self._combo_score(text, pname, "province")
+            if sc > best_p:
+                best_prov, best_p = pname, sc
+        result["Provinsi"] = best_prov if best_p >= 0.58 else None
+
+        # Resolve province_id from chosen name
+        prov_id = None
+        for pid, pname in self.provinces.items():
+            if pname == result["Provinsi"]:
+                prov_id = pid
+                break
+
+        # City (prefer within province)
+        def best_city_in(_prov_id: Optional[str]) -> Optional[str]:
+            if not _prov_id:
+                return None
+            best_name, best_s = None, 0.0
+            for cid, cname in self.cities.get(_prov_id, {}).items():
+                sc = self._combo_score(text, cname, "city")
+                if sc > best_s:
+                    best_name, best_s = cname, sc
+            return best_name if best_s >= 0.58 else None
+
+        city = best_city_in(prov_id) if prov_id else None
+        if not city:
+            best_name, best_s = None, 0.0
+            for _pid, cmap in self.cities.items():
+                for _cid, cname in cmap.items():
+                    sc = self._combo_score(text, cname, "city")
+                    if sc > best_s:
+                        best_name, best_s = cname, sc
+            city = best_name if best_s >= 0.60 else None
+        result["Kota"] = city
+
+        # District (prefer within resolved city)
+        def best_dist_in(city_name: Optional[str]) -> Optional[str]:
+            if not city_name:
+                return None
+            best_city_id, best_s = None, 0.0
+            for _pid, cmap in self.cities.items():
+                for _cid, cname in cmap.items():
+                    sc = self._combo_score(city_name, cname, "city")
+                    if sc > best_s:
+                        best_city_id, best_s = _cid, sc
+            if not best_city_id:
+                return None
+            best_name, best_sc = None, 0.0
+            for did, dname in self.districts.get(best_city_id, {}).items():
+                sc = self._combo_score(text, dname, "district")
+                if sc > best_sc:
+                    best_name, best_sc = dname, sc
+            return best_name if best_sc >= 0.58 else None
+
+        kec = best_dist_in(result["Kota"])
+        if not kec:
+            best_name, best_s = None, 0.0
+            for _cid, dmap in self.districts.items():
+                for did, dname in dmap.items():
+                    sc = self._combo_score(text, dname, "district")
+                    if sc > best_s:
+                        best_name, best_s = dname, sc
+            kec = best_name if best_s >= 0.60 else None
+        result["Kecamatan"] = kec
+
+        # Village (prefer within resolved district)
+        def best_vill_in(dist_name: Optional[str]) -> Optional[str]:
+            if not dist_name:
+                return None
+            best_dist_id, best_ds = None, 0.0
+            for _cid, dmap in self.districts.items():
+                for did, dname in dmap.items():
+                    sc = self._combo_score(dist_name, dname, "district")
+                    if sc > best_ds:
+                        best_dist_id, best_ds = did, sc
+            if not best_dist_id:
+                return None
+            best_vname, best_vs = None, 0.0
+            for vid, vname in self.villages.get(best_dist_id, {}).items():
+                sc = self._combo_score(text, vname, "village")
+                if sc > best_vs:
+                    best_vname, best_vs = vname, sc
+            return best_vname if best_vs >= 0.60 else None
+
+        kel = best_vill_in(result["Kecamatan"])
+        if not kel:
+            best_vname, best_vs = None, 0.0
+            for did, vmap in self.villages.items():
+                for vid, vname in vmap.items():
+                    sc = self._combo_score(text, vname, "village")
+                    if sc > best_vs:
+                        best_vname, best_vs = vname, sc
+            kel = best_vname if best_vs >= 0.62 else None
+        result["Kel_Desa"] = kel
+
+        return result
