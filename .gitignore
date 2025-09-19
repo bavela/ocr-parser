@@ -1,2 +1,68 @@
-__pycache__
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Build / distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type-check / lint caches
+.mypy_cache/
+.pytype/
+.ruff_cache/
+
+# Logs & reports
+*.log
+reports/
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# SQLite & other local DBs
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# Environment files
+.env
+.env.*
+*.env
+
+# Editors / IDE
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project-specific temp/output (uncomment if you use these)
+# data/
+# outputs/
+# tmp/
+# cache/
