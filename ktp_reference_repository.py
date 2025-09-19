@@ -7,6 +7,7 @@ import unicodedata
 import difflib
 import string
 from dataclasses import dataclass, asdict
+from functools import lru_cache
 from typing import List, Tuple, Any, Dict, Optional
 
 
@@ -15,16 +16,13 @@ from typing import List, Tuple, Any, Dict, Optional
 # ----------------------------
 @dataclass(frozen=True)
 class Ref:
-    """
-    Represent a single reference value inside a category (e.g., 'agama' -> 'ISLAM').
+    """Typed reference value inside a category (e.g., 'agama' -> 'ISLAM').
+
+    What:
+        Represents one canonical option in a logical KTP category.
 
     Why:
-        Using a typed model keeps return types consistent across repositories and
-        simplifies downstream code (no sqlite rows or bare strings to juggle).
-
-    Fields:
-        category (str): The logical bucket of this value (e.g., 'agama').
-        value (str): Canonical display label (uppercase, stable form).
+        Typed values make APIs consistent and discourage direct sqlite row handling in callers.
     """
     category: str
     value: str
@@ -39,26 +37,19 @@ class Ref:
 
 
 class KTPReferenceRepository:
-    """
-    SQLite-backed repository for non-administrative KTP reference fields with
-    pg_trgm-ish fuzzy search and simple 'get all' access.
+    """SQLite-backed repository for non-administrative KTP reference fields.
+
+    What:
+        Centralized store of small, finite vocabularies (gender, blood type, religion,
+        marital status, jobs, citizenship, and canonical field labels) with fast fuzzy search.
 
     Why:
-        Centralizes standard sets (gender, blood type, religion, etc.) in one place,
-        enabling consistent UI options and resilient fuzzy lookups across the app.
-
-    Covered categories (keys):
-      - 'jenis_kelamin'      (LAKI-LAKI, PEREMPUAN)
-      - 'golongan_darah'     (A, B, AB, O, -)
-      - 'agama'              (ISLAM, KRISTEN, KATHOLIK, HINDU, BUDDHA, KONGHUCU, ...)
-      - 'status_perkawinan'  (BELUM KAWIN, KAWIN, CERAI HIDUP, CERAI MATI)
-      - 'pekerjaan'          (common Dukcapil-style job labels)
-      - 'kewarganegaraan'    (WNI, WNA)
+        Keeps enumerations uniform across the app and provides resilient matching for OCR noise.
     """
 
     # OCR digit->letter fix (consistent with admin repo)
     _OCR_DIGIT_TO_LETTER = str.maketrans({
-        '0': 'O', '1': 'I', '2': 'Z', '3': 'E', '4': 'A', '5': 'S', '6': 'G', '7': 'T', '8': 'B', '9': 'G'
+        '0': 'O', '1': 'I', '2': 'Z', '3': 'E', '4': 'A', '5': 'S', '6': 'G', '7': 'T', '8': 'B'
     })
 
     # punctuation map: translate to space (no regex)
@@ -74,13 +65,13 @@ class KTPReferenceRepository:
     ]
 
     def __init__(self, sqlite_path: str | None = None):
-        """Initialize the repository and ensure schema/seed so lookups work immediately.
+        """Initialize store and seed defaults.
+
+        Why:
+            Reference sets must be available immediately for both dropdowns and fuzzy lookups.
 
         Args:
-            sqlite_path (str | None): SQLite file path for persistence; None keeps data in-memory.
-
-        Returns:
-            None
+            sqlite_path: SQLite file path (persistent) or None (in-memory).
         """
         self.conn = sqlite3.connect(sqlite_path or ":memory:")
         self.conn.execute("PRAGMA journal_mode=WAL;")
@@ -94,10 +85,10 @@ class KTPReferenceRepository:
     # Schema & seeding
     # ----------------------------
     def _ensure_schema(self) -> None:
-        """Create the reference-value table and indexes to support fast, scoped searches.
+        """Create the reference-value table and indices.
 
-        Returns:
-            None
+        Why:
+            Category + normalized feature indices keep searches deterministic and fast.
         """
         cur = self.conn.cursor()
         cur.execute("""
@@ -118,10 +109,10 @@ class KTPReferenceRepository:
         self.conn.commit()
 
     def _seed_defaults_if_empty(self) -> None:
-        """Insert standard Indonesian sets once so the app has sensible defaults.
+        """Insert standard Indonesian sets once.
 
-        Returns:
-            None
+        Why:
+            Real KTPs use a small, known vocabulary—seeding unlocks immediate matching.
         """
         cur = self.conn.cursor()
         cur.execute("SELECT COUNT(1) FROM refs")
@@ -129,23 +120,29 @@ class KTPReferenceRepository:
         if count:
             return
 
+        # Expanded jobs for better recall (common Dukcapil-style labels and synonyms)
+        jobs = [
+            "PELAJAR/MAHASISWA", "KARYAWAN SWASTA", "PEGAWAI SWASTA", "SWASTA",
+            "PNS", "PEGAWAI NEGERI SIPIL", "HONORER", "WIRASWASTA",
+            "GURU", "DOSEN", "NELAYAN", "PETANI/PEKEBUN", "BURUH HARIAN LEPAS",
+            "SOPIR", "PERAWAT", "TNI", "POLRI", "PENSIUNAN", "IBU RUMAH TANGGA",
+            "TIDAK BEKERJA"
+        ]
+
         data: Dict[str, List[str]] = {
             "jenis_kelamin": ["LAKI-LAKI", "PEREMPUAN"],
             "golongan_darah": ["A", "B", "AB", "O", "-"],
+            # Keep canonical religion labels compact; parser may map synonyms to these.
             "agama": [
                 "ISLAM", "KRISTEN", "KATHOLIK", "HINDU", "BUDDHA", "KONGHUCU",
                 "KEPERCAYAAN KEPADA TUHAN YME"
             ],
             "status_perkawinan": ["BELUM KAWIN", "KAWIN", "CERAI HIDUP", "CERAI MATI"],
-            "pekerjaan": [
-                "PELAJAR/MAHASISWA", "KARYAWAN SWASTA", "PNS", "WIRASWASTA",
-                "GURU", "NELAYAN", "PETANI/PEKEBUN", "BURUH HARIAN LEPAS",
-                "TIDAK BEKERJA", "IBU RUMAH TANGGA", "TNI", "POLRI", "PENSIUNAN"
-            ],
+            "pekerjaan": jobs,
             "kewarganegaraan": ["WNI", "WNA"],
         }
 
-        rows = []
+        rows: List[Tuple[str, str, str, str, str, str, str]] = []
         for cat, values in data.items():
             for v in values:
                 value_off = self._std_official(v)
@@ -162,10 +159,10 @@ class KTPReferenceRepository:
         self.conn.commit()
 
     def _ensure_fields_table(self) -> None:
-        """Create a tiny table to store KTP field names to enable get/search over fields.
+        """Create the field-names table for KTP schema discovery.
 
-        Returns:
-            None
+        Why:
+            Lets callers search/display canonical field labels consistently.
         """
         cur = self.conn.cursor()
         cur.execute("""
@@ -184,10 +181,10 @@ class KTPReferenceRepository:
         self.conn.commit()
 
     def _seed_fields_if_empty(self) -> None:
-        """Seed the canonical KTP field names so they are discoverable and searchable.
+        """Seed canonical KTP field names.
 
-        Returns:
-            None
+        Why:
+            Enables search and validation against the app’s field vocabulary.
         """
         cur = self.conn.cursor()
         cur.execute("SELECT COUNT(1) FROM ref_fields")
@@ -195,7 +192,7 @@ class KTPReferenceRepository:
         if count:
             return
 
-        rows = []
+        rows: List[Tuple[str, str, str, str, str, str]] = []
         for f in self._REF_FIELDS:
             norm = self._norm_generic(f)
             nns = self._nospace(norm)
@@ -213,97 +210,78 @@ class KTPReferenceRepository:
     # Normalization & scoring (regex-free)
     # ----------------------------
     @staticmethod
+    @lru_cache(maxsize=8192)
     def _std_official(s: str) -> str:
-        """Return a stable uppercase label so values render uniformly across the app.
+        """Return a stable uppercase label for consistent display.
 
         Args:
-            s (str): Original text.
+            s: Original text.
 
         Returns:
-            str: Uppercased, whitespace-collapsed display form.
+            Uppercased, whitespace-collapsed text.
         """
         t = unicodedata.normalize("NFKC", s).strip()
         return " ".join(t.split()).upper()
 
-    def _norm_generic(self, s: str) -> str:
-        """Create a robust, regex-free normalized string to withstand OCR/punctuation noise.
+    @classmethod
+    @lru_cache(maxsize=65536)
+    def _norm_generic(cls, s: str) -> str:
+        """Normalize a string for robust, deterministic search.
+
+        Why:
+            Dampens OCR/punctuation noise without relying on regex-heavy pipelines.
 
         Args:
-            s (str): Input text to normalize.
+            s: Input text.
 
         Returns:
-            str: Uppercased, punctuation-folded, whitespace-collapsed text with OCR fixes.
+            Uppercased, punctuation-folded, whitespace-collapsed string with OCR fixes.
         """
         if not s:
             return ""
         t = unicodedata.normalize("NFKC", s)
-        t = t.translate(self._OCR_DIGIT_TO_LETTER)
-        t = t.translate(self._PUNCT_TO_SPACE)
+        t = t.translate(cls._OCR_DIGIT_TO_LETTER)
+        t = t.translate(cls._PUNCT_TO_SPACE)
         t = " ".join(t.split())
         return t.upper()
 
     @staticmethod
+    @lru_cache(maxsize=65536)
     def _nospace(s: str) -> str:
-        """Drop whitespace from normalized text to make glued-token comparisons resilient.
-
-        Args:
-            s (str): Normalized text.
-
-        Returns:
-            str: Text with all spaces removed.
-        """
+        """Drop whitespace from normalized text to tolerate glued tokens."""
         return "".join(ch for ch in s if not ch.isspace())
 
     @staticmethod
+    @lru_cache(maxsize=65536)
     def _tokens(norm: str) -> str:
-        """Expose space-normalized tokens so token-level comparisons stay simple.
-
-        Args:
-            norm (str): Normalized text.
-
-        Returns:
-            str: Space-separated tokens (single spaces).
-        """
+        """Expose space-normalized tokens for simple token-level comparisons."""
         return " ".join(norm.split())
 
     @staticmethod
+    @lru_cache(maxsize=65536)
     def _trigrams(nns: str) -> str:
-        """Produce pg_trgm-like character trigrams for cheap candidate narrowing.
-
-        Args:
-            nns (str): Normalized text without spaces.
-
-        Returns:
-            str: Space-padded trigram list, e.g. " abc bcd cde ".
-        """
+        """Produce pg_trgm-like trigrams for cheap candidate narrowing."""
         s = f"  {nns}  "
         tris = [s[i:i+3] for i in range(len(s) - 2)]
         return " " + " ".join(tris) + " "
 
     @staticmethod
+    @lru_cache(maxsize=65536)
     def _lev(a: str, b: str) -> float:
-        """Measure character-level similarity so near-duplicates rank higher.
-
-        Args:
-            a (str): First string.
-            b (str): Second string.
-
-        Returns:
-            float: Ratio in [0, 1].
-        """
+        """Character-level similarity ratio in [0, 1]."""
         if not a or not b:
             return 0.0
         return difflib.SequenceMatcher(None, a.upper(), b.upper()).ratio()
 
     def _token_overlap(self, a: str, b: str) -> float:
-        """Estimate shared vocabulary so semantically aligned values win ties.
+        """Estimate shared vocabulary to encourage semantically aligned values.
 
         Args:
-            a (str): First string.
-            b (str): Second string.
+            a: First string.
+            b: Second string.
 
         Returns:
-            float: Overlap score in [0, 1].
+            Overlap score in [0, 1].
         """
         A = set(self._norm_generic(a).split())
         B = set(self._norm_generic(b).split())
@@ -312,14 +290,17 @@ class KTPReferenceRepository:
         return len(A & B) / max(1, len(A | B))
 
     def _score(self, q: str, cand: str) -> float:
-        """Blend spaced/no-space similarity and token overlap into one robust score.
+        """Blend spaced/no-space similarity and token overlap into one score.
+
+        Why:
+            Balances letter-level noise tolerance with semantic hints.
 
         Args:
-            q (str): Query text.
-            cand (str): Candidate text.
+            q: Query text.
+            cand: Candidate text.
 
         Returns:
-            float: Composite similarity score in [0, 1].
+            Composite similarity score in [0, 1].
         """
         a1, b1 = self._norm_generic(q), self._norm_generic(cand)
         a2, b2 = self._nospace(a1), self._nospace(b1)
@@ -329,25 +310,20 @@ class KTPReferenceRepository:
     # Core helpers
     # ----------------------------
     def _row_to_ref(self, category: str, value_off: str) -> Ref:
-        """Create a typed Ref from raw DB values so callers never touch rows.
-
-        Args:
-            category (str): Category key (e.g., 'agama').
-            value_off (str): Canonical display value.
-
-        Returns:
-            Ref: Strongly-typed reference value.
-        """
+        """Create a typed Ref from canonical DB value."""
         return Ref(category=category, value=value_off)
 
     def _get_all(self, category: str) -> List[Ref]:
-        """Return every value in a category so UIs can render full dropdowns.
+        """Return every value in a category.
+
+        Why:
+            Ideal for building dropdowns and validating inputs.
 
         Args:
-            category (str): Category key (e.g., 'pekerjaan').
+            category: Category key (e.g., 'pekerjaan').
 
         Returns:
-            List[Ref]: All values as typed models, ordered by display label.
+            All values as typed Ref models, ordered by display label.
         """
         cur = self.conn.cursor()
         rows = cur.execute("""
@@ -357,38 +333,43 @@ class KTPReferenceRepository:
         """, (category,)).fetchall()
         return [self._row_to_ref(category, r[0]) for r in rows]
 
-    def _candidates(self, category: str, q: str, limit: int) -> list[sqlite3.Row]:
+    def _candidates(self, category: str, q: str, limit: int) -> List[sqlite3.Row]:
         """Fetch a small, likely set of values in a category to be scored precisely.
 
+        Why:
+            Narrowing at SQL level keeps the Python ranking stage small and quick.
+
         Args:
-            category (str): Category key (e.g., 'agama').
-            q (str): Free-form user query.
-            limit (int): Upper bound on candidates fetched for scoring.
+            category: Category key (e.g., 'agama').
+            q: Free-form user query.
+            limit: Upper bound on candidates fetched for scoring.
 
         Returns:
-            list[sqlite3.Row]: Raw rows restricted to the category and basic trigram/prefix filters.
+            Raw rows restricted to the category with basic trigram/prefix filters.
         """
         self.conn.row_factory = sqlite3.Row
         cur = self.conn.cursor()
 
         norm = self._norm_generic(q)
         nns = self._nospace(norm)
+        qlen = len(nns)
         p3, q3 = norm[:3], nns[:3]
 
         tri_text = self._trigrams(nns)
         tri_list = tri_text.strip().split()[:4]
 
         where = ["category = ?"]
-        params: list[Any] = [category]
+        params: List[Any] = [category]
 
         if p3:
             where.append("norm_name LIKE ?")
             params.append(f"{p3}%")
-        if q3:
+        # Loosen for very short queries (≤ 3 chars): skip nospace and trigram predicates
+        if q3 and qlen > 3:
             where.append("norm_nospace LIKE ?")
             params.append(f"{q3}%")
 
-        if tri_list:
+        if tri_list and qlen > 3:
             parts = []
             for tri in tri_list:
                 parts.append("trigrams LIKE ?")
@@ -416,15 +397,18 @@ class KTPReferenceRepository:
         return cur.execute(sql2, (category,)).fetchall()
 
     def _search(self, category: str, q: str, k: int) -> List[Tuple[Ref, float]]:
-        """Rank and return the top-k matches in a category for suggestions/autocomplete.
+        """Rank and return the top-k matches in a category.
+
+        Why:
+            Keeps matching robust to OCR noise while staying explainable.
 
         Args:
-            category (str): Category key (e.g., 'status_perkawinan').
-            q (str): Free-form user query.
-            k (int): Number of top results to return.
+            category: Category key (e.g., 'status_perkawinan').
+            q: Free-form query.
+            k: Number of top results.
 
         Returns:
-            List[Tuple[Ref, float]]: Ranked (Ref, score) pairs, score in [0, 1].
+            Ranked (Ref, score) pairs in [0, 1].
         """
         rows = self._candidates(category, q, limit=max(200, k * 12))
         scored: List[Tuple[Ref, float]] = []
@@ -438,10 +422,10 @@ class KTPReferenceRepository:
     # Public API (reference field names)
     # ----------------------------
     def get_refs(self) -> List[str]:
-        """Return all possible KTP field names so callers can present/validate inputs.
+        """Return all canonical KTP field names.
 
-        Returns:
-            List[str]: Field labels (e.g., "Nama", "Agama", "Kota_Terbit") in canonical form.
+        Why:
+            Allows UIs and parsers to align on a single vocabulary.
         """
         cur = self.conn.cursor()
         rows = cur.execute("""
@@ -451,36 +435,37 @@ class KTPReferenceRepository:
         return [r[0] for r in rows]
 
     def search_refs(self, q: str, k: int = 10) -> List[Tuple[str, float]]:
-        """Search across KTP field names so UIs can quickly jump to the right field.
+        """Search across KTP field names.
 
         Args:
-            q (str): Free-form query (e.g., 'tempat lahir').
-            k (int): Number of top results to return.
+            q: Free-form query (e.g., 'tempat lahir').
+            k: Number of results.
 
         Returns:
-            List[Tuple[str, float]]: Ranked (field_name, score) pairs.
+            Ranked (field_name, score) pairs.
         """
         self.conn.row_factory = sqlite3.Row
         cur = self.conn.cursor()
 
         norm = self._norm_generic(q)
         nns = self._nospace(norm)
+        qlen = len(nns)
         p3, q3 = norm[:3], nns[:3]
 
         tri_text = self._trigrams(nns)
         tri_list = tri_text.strip().split()[:4]
 
         where = []
-        params: list[Any] = []
+        params: List[Any] = []
 
         if p3:
             where.append("norm_name LIKE ?")
             params.append(f"{p3}%")
-        if q3:
+        if q3 and qlen > 3:
             where.append("norm_nospace LIKE ?")
             params.append(f"{q3}%")
 
-        if tri_list:
+        if tri_list and qlen > 3:
             parts = []
             for tri in tri_list:
                 parts.append("trigrams LIKE ?")
@@ -503,127 +488,57 @@ class KTPReferenceRepository:
     # Public API (category-specific wrappers)
     # ----------------------------
     def get_genders(self) -> List[Ref]:
-        """All values for Jenis_Kelamin so dropdowns remain consistent.
-
-        Returns:
-            List[Ref]: Gender values as typed models.
-        """
+        """All values for Jenis_Kelamin."""
         return self._get_all("jenis_kelamin")
 
     def search_genders(self, q: str, k: int = 10) -> List[Tuple[Ref, float]]:
-        """Find the closest Jenis_Kelamin values for a free-form query.
-
-        Args:
-            q (str): User query (e.g., 'prmpn').
-            k (int): Top results to return.
-
-        Returns:
-            List[Tuple[Ref, float]]: Ranked (Ref, score) pairs.
-        """
+        """Find the closest Jenis_Kelamin values for a free-form query."""
         return self._search("jenis_kelamin", q, k)
 
     def get_blood_types(self) -> List[Ref]:
-        """All values for Golongan_Darah so input choices stay standardized.
-
-        Returns:
-            List[Ref]: Blood types as typed models.
-        """
+        """All values for Golongan_Darah."""
         return self._get_all("golongan_darah")
 
     def search_blood_types(self, q: str, k: int = 10) -> List[Tuple[Ref, float]]:
-        """Find the closest Golongan_Darah values for a free-form query.
-
-        Args:
-            q (str): User query (e.g., 'ab').
-            k (int): Top results to return.
-
-        Returns:
-            List[Tuple[Ref, float]]: Ranked (Ref, score) pairs.
-        """
+        """Find the closest Golongan_Darah values for a free-form query."""
         return self._search("golongan_darah", q, k)
 
     def get_religions(self) -> List[Ref]:
-        """All values for Agama to keep religious labels uniform.
-
-        Returns:
-            List[Ref]: Religions as typed models.
-        """
+        """All values for Agama."""
         return self._get_all("agama")
 
     def search_religions(self, q: str, k: int = 10) -> List[Tuple[Ref, float]]:
-        """Find the closest Agama values for a free-form query.
-
-        Args:
-            q (str): User query (e.g., 'katolik').
-            k (int): Top results to return.
-
-        Returns:
-            List[Tuple[Ref, float]]: Ranked (Ref, score) pairs.
-        """
+        """Find the closest Agama values for a free-form query."""
         return self._search("agama", q, k)
 
     def get_marital_statuses(self) -> List[Ref]:
-        """All values for Status_Perkawinan so forms align with Dukcapil wording.
-
-        Returns:
-            List[Ref]: Marital statuses as typed models.
-        """
+        """All values for Status_Perkawinan."""
         return self._get_all("status_perkawinan")
 
     def search_marital_statuses(self, q: str, k: int = 10) -> List[Tuple[Ref, float]]:
-        """Find the closest Status_Perkawinan values for a free-form query.
-
-        Args:
-            q (str): User query (e.g., 'blm kawin').
-            k (int): Top results to return.
-
-        Returns:
-            List[Tuple[Ref, float]]: Ranked (Ref, score) pairs.
-        """
+        """Find the closest Status_Perkawinan values for a free-form query."""
         return self._search("status_perkawinan", q, k)
 
     def get_jobs(self) -> List[Ref]:
-        """All values for Pekerjaan so occupation inputs remain normalized.
-
-        Returns:
-            List[Ref]: Occupation labels as typed models.
-        """
+        """All values for Pekerjaan."""
         return self._get_all("pekerjaan")
 
     def search_jobs(self, q: str, k: int = 10) -> List[Tuple[Ref, float]]:
-        """Find the closest Pekerjaan values for a free-form query.
-
-        Args:
-            q (str): User query (e.g., 'wira usaha').
-            k (int): Top results to return.
-
-        Returns:
-            List[Tuple[Ref, float]]: Ranked (Ref, score) pairs.
-        """
+        """Find the closest Pekerjaan values for a free-form query."""
         return self._search("pekerjaan", q, k)
 
     def get_citizenships(self) -> List[Ref]:
-        """All values for Kewarganegaraan so nationality stays consistent.
-
-        Returns:
-            List[Ref]: Citizenship labels as typed models.
-        """
+        """All values for Kewarganegaraan."""
         return self._get_all("kewarganegaraan")
 
     def search_citizenships(self, q: str, k: int = 10) -> List[Tuple[Ref, float]]:
-        """Find the closest Kewarganegaraan values for a free-form query.
-
-        Args:
-            q (str): User query (e.g., 'wnl').
-            k (int): Top results to return.
-
-        Returns:
-            List[Tuple[Ref, float]]: Ranked (Ref, score) pairs.
-        """
+        """Find the closest Kewarganegaraan values for a free-form query."""
         return self._search("kewarganegaraan", q, k)
 
 
 if __name__ == "__main__":
+    # Quick standalone sanity check for the refs repository.
+    # Run this file directly to verify seeding and fuzzy search behavior.
     repo = KTPReferenceRepository(sqlite_path="ktp_refs.db")
 
     print("\n== REF FIELDS ==")
@@ -635,54 +550,13 @@ if __name__ == "__main__":
     print("Blood Types:", [r.to_dict() for r in repo.get_blood_types()])
     print("Religions:", [r.to_dict() for r in repo.get_religions()])
     print("Marital Statuses:", [r.to_dict() for r in repo.get_marital_statuses()])
-    print("Jobs:", [r.to_dict() for r in repo.get_jobs()])
+    print("Jobs:", [r.to_dict() for r in repo.get_jobs()][:8], "... (total:", len(repo.get_jobs()), ")")
     print("Citizenships:", [r.to_dict() for r in repo.get_citizenships()])
 
     print("\n== SEARCH EXAMPLES ==")
-    print('Religions ~ "katolik":', [(r.value, s) for r, s in repo.search_religions("katolik")])
-    print('Genders ~ "prmpn":', [(r.value, s) for r, s in repo.search_genders("prmpn")])
-    print('Blood Types ~ "ab":', [(r.value, s) for r, s in repo.search_blood_types("ab")])
-    print('Marital Statuses ~ "blm kawin":', [(r.value, s) for r, s in repo.search_marital_statuses("blm kawin")])
-    print('Jobs ~ "wira usaha":', [(r.value, s) for r, s in repo.search_jobs("wira usaha")])
-    print('Citizenship ~ "wnl":', [(r.value, s) for r, s in repo.search_citizenships("wnl")])
-
-
-
-# Design notes — KTPReferenceRepository usage with OCRParser (no AI/ML)
-
-# Purpose:
-#     Centralize non-administrative reference sets (gender, blood type, religion, marital status,
-#     job, citizenship, and field labels) in SQLite to support fast "get all" and fuzzy search.
-
-# Integration patterns:
-#     • Dual-pass lookups from OCRParser:
-#         1) Label-guided: when a label is detected, search only the next 1–8 tokens.
-#         2) Global: if label is missing/uncertain, search the entire flattened token stream.
-#            Accept top results only if score ≥ τ and tokens are not already used by another field.
-#     • Alias dictionary:
-#         - Maintain a small, curated alias table for common OCR confusions and abbreviations:
-#           e.g., "PERMPUAN"→"PEREMPUAN", "KAWlN"→"KAWIN", "WNl"→"WNI", "AGM"→"AGAMA".
-#           Normalize inputs with aliases before searching to raise hit rates.
-
-# Search strategy (pg_trgm-ish without extensions):
-#     • Candidate narrowing:
-#         - Category-scoped prefix filters (first 3 chars) on normalized name and nospace.
-#         - Up to 3–4 trigram LIKE filters.
-#         - Limit candidates (≤ 50 ideal for enums) before scoring.
-#     • Scoring (deterministic):
-#         - Composite of Levenshtein(spaced) + Levenshtein(nospace) + token overlap.
-#         - Keep values and scores for UI confidence or audit.
-
-# Performance:
-#     • Cache normalization and previous queries (LRU).
-#     • Deduplicate identical phrases before searching.
-#     • Keep tables small and indexed:
-#         - (category, norm_name), (category, norm_nospace), (category, trigrams).
-
-# UX/Output:
-#     • Public getters return typed Ref models (not raw rows) for consistency with Region model.
-#     • Provide get_refs()/search_refs() to help map free-form UI actions to the canonical field names.
-
-# Thresholds (starting points):
-#     • label-window acceptance ≥ 0.66; global acceptance ≥ 0.60.
-#     • When multiple hits are close, prefer the one adjacent to its label; otherwise pick top score.
+    print('Religions ~ "katolik":', [(r.value, f"{s:.3f}") for r, s in repo.search_religions("katolik")])
+    print('Genders ~ "prmpn":', [(r.value, f"{s:.3f}") for r, s in repo.search_genders("prmpn")])
+    print('Blood Types ~ "ab":', [(r.value, f"{s:.3f}") for r, s in repo.search_blood_types("ab")])
+    print('Marital ~ "blm kawin":', [(r.value, f"{s:.3f}") for r, s in repo.search_marital_statuses("blm kawin")])
+    print('Jobs ~ "wira usaha":', [(r.value, f"{s:.3f}") for r, s in repo.search_jobs("wira usaha")][:5])
+    print('Citizenship ~ "wnl":', [(r.value, f"{s:.3f}") for r, s in repo.search_citizenships("wnl")])

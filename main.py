@@ -4,15 +4,20 @@ filepath: main.py
 
 Refined OCRParser focused on robust field-label detection and safer OCR normalization.
 Now integrates:
-  - AdministrativeRegionsRepository for Province → City/Kab → District → Village normalization (via search_*).
-  - KTPReferenceRepository for enumerated KTP fields (gender, religion, etc.) using trigram search.
+  - AdministrativeRegionsRepository for Province → City/Kab → District → Village normalization (via beam search).
+  - KTPReferenceRepository for enumerated KTP fields (gender, religion, etc.) using dual-pass search
+    (label-window first, then global fallback).
+  - Month-name and numeric date parsing; RT/RW detection in multiple shapes (RT 007 / RW 008 / "007/008").
 
 Why:
   Keep OCR parsing deterministic and maintainable by delegating vocabulary and fuzzy
-  resolution to dedicated repositories with consistent normalization.
+  resolution to dedicated repositories with consistent normalization. Add small, composable
+  heuristics to cover frequent OCR failure modes while keeping behavior explainable.
 
-Author: Assistant (refined for user's OCR KTP pipeline)
+Public API:
+  - OCRParser.interpret(lines: List[str]) -> Dict[str, Any]
 """
+
 from __future__ import annotations
 
 import re
@@ -20,6 +25,7 @@ import json
 import logging
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import List, Dict, Any, Optional, Tuple
 
 try:
@@ -46,13 +52,19 @@ class ParsedField:
 class OCRParser:
     """
     Normalize OCR text into structured KTP fields by:
-      - detecting noisy labels (glued or spaced),
-      - extracting obvious regex-able values (NIK, dates, RT/RW),
-      - delegating fuzzy vocabulary matching to repositories.
+      - detecting noisy labels (glued or spaced) with look-ahead and small look-back,
+      - extracting structured values via regex/heuristics (NIK, dates, RT/RW),
+      - delegating fuzzy vocabulary matching to repositories,
+      - resolving regions with a small hierarchy-aware beam search.
 
     Why:
       Keeps parsing logic small and robust; the repos own search/normalization,
       while the parser focuses on segmentation and assembly.
+
+    Notes:
+      • Deterministic: no ML models; string ops + SQLite-backed repos.
+      • Typesafe: explicit Optional[str] on every output field.
+      • Debug: set `debug=True` to attach confidences/evidence (non-breaking).
     """
 
     # Numeric-dominant token cleanup (letters that often mean digits)
@@ -76,18 +88,61 @@ class OCRParser:
         "AGAMA", "PEKERJAAN",
         "JENIS KELAMIN", "GOLONGAN DARAH",
         "STATUS PERKAWINAN",
-        "KEWARGANEGARAAN", "KEWARGANEGARAN",
+        "KEWARGANEGARAAN",
         "BERLAKU HINGGA",
         "KOTA TERBIT", "TANGGAL TERBIT"
     ]
 
+    # Aliases for frequent OCR confusions (labels/keywords only; values handled later)
+    LABEL_ALIASES: Dict[str, str] = {
+        "TEMPATTGLLAHR": "TEMPAT TGL LAHIR",
+        "TEMPATTGL": "TEMPAT TGL LAHIR",
+        "JENSKELMN": "JENIS KELAMIN",
+        "GOLDRH": "GOLONGAN DARAH",
+        "KELDES": "KEL DESA",
+        "KEWARGANEGARAN": "KEWARGANEGARAAN",
+        "STUSPRKAWNAN": "STATUS PERKAWINAN",
+        "ALMAT": "ALAMAT",
+        "RTRW": "RT",  # will still parse RW via value
+    }
+
+    VALUE_ALIASES: Dict[str, str] = {
+        # common OCR in-values fixes for enums
+        "PERMPUAN": "PEREMPUAN",
+        "KAWlN": "KAWIN",          # l->I confusion
+        "BELUMKAWIN": "BELUM KAWIN",
+        "WNl": "WNI",
+        "BUDHA": "BUDDHA",
+        "KRISTEN PROTESTAN": "KRISTEN",
+        "KRISTEN KATOLIK": "KATHOLIK",
+        "SWASTA": "KARYAWAN SWASTA",  # map to common canonical
+        "PEGAWAI SWASTA": "KARYAWAN SWASTA",
+    }
+
+    # Month names for Indonesian cards (uppercased after normalization)
+    MONTHS_ID: Dict[str, str] = {
+        "JAN": "01", "JANUARI": "01",
+        "FEB": "02", "FEBRUARI": "02",
+        "MAR": "03", "MARET": "03",
+        "APR": "04", "APRIL": "04",
+        "MEI": "05",
+        "JUN": "06", "JUNI": "06",
+        "JUL": "07", "JULI": "07",
+        "AGU": "08", "AGUSTUS": "08",
+        "SEP": "09", "SEPT": "09", "SEPTEMBER": "09",
+        "OKT": "10", "OKTOBER": "10",
+        "NOV": "11", "NOVEMBER": "11",
+        "DES": "12", "DESEMBER": "12",
+    }
+
     # Quick regexes for obvious numbers/dates/RT-RW
-    NIK_RE = re.compile(r'\b[0-9OIl\|]{15,18}\b')
-    DATE_RE = re.compile(r'\b[0-3]?\d[-/][0-1]?\d[-/][0-9OIl]{2,4}\b')
+    NIK_RE = re.compile(r'\b[0-9OIL\|]{15,18}\b')
+    DATE_NUMERIC_RE = re.compile(r'\b[0-3]?\d[-/][0-1]?\d[-/][12]?\d{2,3}\b')
     RT_RW_EXPLICIT_RE = (
         re.compile(r'\bRT\W*0*?(\d{1,3})\b', re.IGNORECASE),
         re.compile(r'\bRW\W*0*?(\d{1,3})\b', re.IGNORECASE)
     )
+    RT_RW_SLASH_RE = re.compile(r'(?<!\d)(\d{1,3})\s*/\s*(\d{1,3})(?!\d)')
 
     def __init__(
         self,
@@ -95,31 +150,34 @@ class OCRParser:
         regions: Optional[AdministrativeRegionsRepository] = None,
         refs: Optional[KTPReferenceRepository] = None,
         field_labels: Optional[List[str]] = None,
-        thresholds: Optional[Dict[str, float]] = None
+        thresholds: Optional[Dict[str, float]] = None,
+        debug: bool = False
     ):
         """
         Prepare the parser with repositories and label/threshold configs.
 
+        Why:
+            Keep parsing configurable and auditable. Repos are optional; parser still works
+            with pass-through heuristics when repos are unavailable.
+
         Args:
-            regions (Optional[AdministrativeRegionsRepository]):
-                Region repository used to normalize Provinsi/Kota/Kecamatan/Kel_Desa.
-            refs (Optional[KTPReferenceRepository]):
-                Reference repository used to normalize enumerated fields (gender, religion, etc.).
-            field_labels (Optional[List[str]]):
-                Override candidate label strings to detect in noisy OCR.
-            thresholds (Optional[Dict[str, float]]):
-                Tuning knobs for label matching and cutoffs. Sensible defaults provided.
+            regions: Region repository used to normalize Provinsi/Kota/Kecamatan/Kel_Desa.
+            refs: Reference repository used to normalize enumerated fields (gender, religion, etc.).
+            field_labels: Override/augment candidate label strings to detect in noisy OCR.
+            thresholds: Tuning knobs for label matching and cutoffs. Sensible defaults provided.
+            debug: When True, attach `_debug` evidence (confidences/candidates) to the output.
 
         Returns:
             None
         """
         self.regions = regions
         self.refs = refs
+        self.debug = debug
 
-        # Label candidates: merge defaults with repo field names if available
+        # Label candidates: merge defaults with repo field names if available, plus aliases.
         label_pool = set(lbl.upper() for lbl in (field_labels or self.DEFAULT_LABELS))
+        label_pool |= set(self.LABEL_ALIASES.values())
         if self.refs:
-            # Add canonical KTP field names as hints
             for f in self.refs.get_refs():
                 label_pool.add(f.replace('_', ' ').upper())
         self.field_labels = sorted(label_pool)
@@ -131,7 +189,8 @@ class OCRParser:
             "label_stop_threshold": 0.70,
             "value_lev_threshold": 0.66,
             "max_label_window": 3,
-            "max_value_tokens": 8
+            "max_value_tokens": 8,
+            "beam_k": 2,  # per-level branching for region search
         }
         self.thresholds = {**defaults, **(thresholds or {})}
 
@@ -143,14 +202,29 @@ class OCRParser:
         parts = re.findall(r'[A-Za-z0-9]+|[^A-Za-z0-9]+', tok)
         return [p for p in parts if re.search(r'[A-Za-z0-9]', p)]
 
+    @staticmethod
+    @lru_cache(maxsize=4096)
+    def _alias_label_norm(s: str) -> str:
+        """Normalize a label-ish string then apply label aliases; why: boost recall with glued/bent labels."""
+        if not s:
+            return ""
+        t = unicodedata.normalize('NFKC', s)
+        t = re.sub(r'\s+', ' ', t).strip().upper()
+        t_ns = t.replace(' ', '')
+        # alias by nospace key if present
+        return OCRParser.LABEL_ALIASES.get(t_ns, t)
+
     def normalize_token(self, tok: str) -> str:
         """Normalize one token to mitigate OCR digit/letter swaps while preserving intent.
 
+        Why:
+            OCR often flips O↔0, I/L/|↔1, S↔5. We bias by token makeup so numbers remain numbers.
+
         Args:
-            tok (str): Raw OCR token (possibly glued).
+            tok: Raw OCR token (possibly glued).
 
         Returns:
-            str: Uppercased, minimally cleaned token to feed label/value heuristics.
+            Uppercased, minimally cleaned token to feed label/value heuristics.
         """
         if not tok:
             return ""
@@ -165,16 +239,19 @@ class OCRParser:
             t = t.translate(self.REVERSE_OCR_MAP)      # alpha-dominant
 
         t = re.sub(r'\s+', ' ', t)
-        return t.upper()
+        return self._alias_label_norm(t)
 
     def tokenize_lines(self, lines: List[str]) -> List[Dict[str, str]]:
         """Turn raw OCR lines into a token stream that preserves dates/numbers.
 
+        Why:
+            Keep line order but analyze on a flat, normalized stream for label/value pairing.
+
         Args:
-            lines (List[str]): Raw OCR lines.
+            lines: Raw OCR lines.
 
         Returns:
-            List[Dict[str, str]]: [{'raw': <raw>, 'norm': <normalized>}, ...]
+            [{'raw': <raw>, 'norm': <normalized>}, ...]
         """
         tokens: List[Dict[str, str]] = []
         for line in lines:
@@ -194,32 +271,63 @@ class OCRParser:
     def _raw_text_for_regex(self, lines: List[str]) -> str:
         """Produce a raw-ish text line preserving date separators so regex remains effective.
 
+        Why:
+            Regex needs `-`/`/` and spacings intact to fish dates/RT/RW reliably.
+
         Args:
-            lines (List[str]): Raw OCR lines.
+            lines: Raw OCR lines.
 
         Returns:
-            str: Lightly normalized text (NFKC, common O/I→digits, compact spaces).
+            Lightly normalized text (NFKC, common O/I/L/|→digits, compact spaces).
         """
         txt = " ".join(lines)
         txt = unicodedata.normalize('NFKC', txt)
-        trans = str.maketrans({'O': '0', 'I': '1', 'l': '1', '|': '1'})
+        trans = str.maketrans({'O': '0', 'I': '1', 'l': '1', 'L': '1', '|': '1', 'Q': '0'})
         txt = txt.translate(trans)
         txt = re.sub(r'\s+', ' ', txt)
         return txt
 
+    # -----------------------
+    # Date parsing (numeric + month-name)
+    # -----------------------
     def _regex_dates_from_raw(self, raw_text: str) -> List[str]:
-        """Collect plausible dates in multiple OCR styles to support TTL and issue dates.
+        """Collect plausible dates in multiple OCR styles to support TTL/issue/expiry.
+
+        Why:
+            Real cards often have month names (e.g., '18 MEI 1995'). We normalize to 'DD-MM-YYYY' when possible.
 
         Args:
-            raw_text (str): Lightly-normalized raw text.
+            raw_text: Lightly-normalized raw text.
 
         Returns:
-            List[str]: Unique date-like strings (separators normalized to '-').
+            Unique date-like strings (separators normalized to '-').
         """
-        strict = re.findall(r'\b[0-3]?\d[-/][0-1]?\d[-/][12]\d{3}\b', raw_text)
-        strict2 = re.findall(r'\b[0-3]?\d[-/][0-1]?\d[-/]\d{2}\b', raw_text)
-        spacey = re.findall(r'\b[0-3]?\d\s[0-1]?\d\s[12]?\d{2,3}\b', raw_text)
-        out = strict + strict2 + [re.sub(r'\s', '-', s) for s in spacey]
+        if not raw_text:
+            return []
+        out: List[str] = []
+
+        # 1) numeric forms
+        for m in self.DATE_NUMERIC_RE.findall(raw_text):
+            out.append(m.replace(' ', '-').replace('/', '-'))
+
+        # 2) month-name forms (ID)
+        #   e.g., 18 MEI 1995, 1 OKTOBER 2012, 05 AGU 12
+        pattern = re.compile(
+            r'\b([0-3]?\d)\s+([A-ZÄËÖÜA-Z]+)\s+([12]?\d{1,3})\b',
+            re.IGNORECASE
+        )
+        for d, mon, y in pattern.findall(raw_text.upper()):
+            mon_num = self.MONTHS_ID.get(mon.strip().upper())
+            if not mon_num:
+                continue
+            yyyy = y
+            if len(y) == 2:  # heuristic 2-digit year → 20xx/19xx? keep as-is to avoid wrong century
+                yyyy = y
+            elif len(y) == 3:  # rare OCR loss, skip
+                continue
+            out.append(f"{int(d):02d}-{mon_num}-{yyyy}")
+
+        # dedup while keeping order
         seen, dedup = set(), []
         for d in out:
             if d not in seen:
@@ -233,32 +341,36 @@ class OCRParser:
     def regex_extract(self, joined_norm: str, *, raw_text: Optional[str] = None) -> Dict[str, Any]:
         """Grab high-confidence fields with regex so the rest can rely on context.
 
+        Why:
+            Structured fields (NIK, dates, RT/RW) are much more reliable via regex than fuzzy search.
+
         Args:
-            joined_norm (str): Normalized token text (joined with spaces).
-            raw_text (Optional[str]): Raw-ish text that preserves separators.
+            joined_norm: Normalized token text (joined with spaces).
+            raw_text: Raw-ish text that preserves separators.
 
         Returns:
-            Dict[str, Any]: Partial extraction: nik, dates, rt, rw (when detected).
+            Partial extraction: nik, dates, rt, rw (when detected).
         """
         out: Dict[str, Any] = {}
 
-        # NIK
-        m = self.NIK_RE.search(joined_norm) or (re.search(r'\b[0-9OIl\|]{15,18}\b', raw_text or "") if raw_text else None)
+        # NIK (prefer raw_text to avoid over-normalization)
+        nik_src = raw_text or joined_norm
+        m = self.NIK_RE.search(nik_src)
         if m:
             r = m.group(0)
-            cleaned = r.replace('O', '0').replace('I', '1').replace('l', '1').replace('|', '1')
+            cleaned = r.replace('O', '0').replace('I', '1').replace('l', '1').replace('L', '1').replace('|', '1').replace('Q', '0')
             digits = re.sub(r'\D', '', cleaned)
             if len(digits) >= 16:
                 digits = digits[:16]
             if len(digits) == 16:
                 out['nik'] = ParsedField(digits, 0.99, 'regex_nik').__dict__
 
-        # dates
+        # dates (numeric + month-name)
         dates = self._regex_dates_from_raw(raw_text or "") if raw_text else []
         if dates:
             out['dates'] = [ParsedField(d, 0.90, 'regex_date').__dict__ for d in dates]
 
-        # RT/RW explicit
+        # RT/RW explicit (RT ddd, RW ddd)
         rt_re, rw_re = self.RT_RW_EXPLICIT_RE
         rt_m = rt_re.search(joined_norm)
         rw_m = rw_re.search(joined_norm)
@@ -267,12 +379,13 @@ class OCRParser:
         if rw_m:
             out['rw'] = ParsedField(rw_m.group(1), 0.95, 'regex_rw').__dict__
 
-        # combined 6-digit RT/RW
-        m6 = re.search(r'\b(\d{6})\b', joined_norm)
-        if m6 and 'rt' not in out and 'rw' not in out:
-            s = m6.group(1)
-            out['rt'] = ParsedField(s[:3], 0.90, 'regex_rt_combined').__dict__
-            out['rw'] = ParsedField(s[3:], 0.90, 'regex_rw_combined').__dict__
+        # combined dd/dd (not only 6 digits)
+        if 'rt' not in out or 'rw' not in out:
+            mslash = self.RT_RW_SLASH_RE.search(raw_text or joined_norm)
+            if mslash:
+                rtv, rwv = mslash.group(1), mslash.group(2)
+                out.setdefault('rt', ParsedField(rtv, 0.90, 'regex_rt_slash').__dict__)
+                out.setdefault('rw', ParsedField(rwv, 0.90, 'regex_rw_slash').__dict__)
 
         return out
 
@@ -285,110 +398,274 @@ class OCRParser:
             return 0.0
         dist = Levenshtein.distance(a.upper(), b.upper())
         return max(0.0, 1.0 - (dist / max(len(a), len(b))))
+    
+    def _key(self, s: str) -> str:
+        """Return an uppercase, no-space, alnum-only key for fast comparisons.
+
+        Produces a stable key to compare tokens/labels independent of spacing/punctuation.
+        OCR noise often inserts/removes separators; a canonical key eliminates those differences.
+
+        Args:
+            s: Arbitrary text.
+
+        Returns:
+            Uppercase nospace alphanumeric key (e.g., "Jenis Kelamin" → "JENISKELAMIN").
+        """
+        return re.sub(r'[^A-Z0-9]+', '', unicodedata.normalize('NFKC', s or '').upper())
+
 
     def _is_label_at(self, tokens: List[Dict[str, str]], pos: int) -> Optional[Tuple[str, int, float]]:
-        """Return (label, window_size, score) if a label is detected starting at pos."""
+        """Detect a field label beginning at `pos` and return (canonical_label, window_size, score).
+
+        Slides a 1..N token window and asks `KTPReferenceRepository.search_refs(...)`
+        to identify the most likely KTP field name for the window content.
+        Lets a single, well-tuned fuzzy search (prefix + trigrams + char distance) handle
+        real-world OCR variations (glued, split, misspelled) without hard-coded aliases.
+
+        Args:
+            tokens: Token stream as produced by `tokenize_lines` (dicts with 'norm').
+            pos:    Index of the token where a label may begin.
+
+        Returns:
+            (canonical_label, window_size, score) if a label is recognized, else None.
+            canonical_label is uppercase with spaces (e.g., "JENIS KELAMIN").
+        """
         n = len(tokens)
         best: Optional[Tuple[str, int, float]] = None
-        maxw = self.thresholds['max_label_window']
+        maxw = int(self.thresholds.get('max_label_window', 3))
+
+        # Score threshold when using refs.search_refs; tuned to catch noisy labels.
+        sr_thresh = float(self.thresholds.get('label_searchrefs_threshold', 0.70))
+
+        # Fallback thresholds using built-in label variants if refs unavailable.
+        lev_sp = float(self.thresholds.get('label_match_threshold', 0.80))
+        lev_ns = float(self.thresholds.get('label_match_nospace_threshold', 0.68))
+
         for w in range(1, maxw + 1):
             if pos + w > n:
                 break
             window_tokens = [tokens[i]['norm'] for i in range(pos, pos + w)]
             joined_space = " ".join(window_tokens)
+
+            # 1) Prefer repository-backed label search when available
+            if self.refs:
+                hits = self.refs.search_refs(joined_space, k=1)
+                if hits:
+                    field_name, score = hits[0]
+                    if score >= sr_thresh:
+                        # Normalize to canonical uppercase with spaces
+                        canon = field_name.replace('_', ' ').upper()
+                        cand = (canon, w, float(score))
+                        if best is None or cand[2] > best[2] or (cand[2] == best[2] and w > best[1]):
+                            best = cand
+                        # continue scanning larger windows to prefer longer, better matches
+                        continue
+
+            # 2) Fallback to internal label pool (no repo case)
             joined_nospace = "".join(window_tokens)
             for var in self._label_variants:
                 r_sp = self._lev_ratio(joined_space, var['label'])
                 r_ns = self._lev_ratio(joined_nospace, var['label_nospace'])
                 r = max(r_sp, r_ns)
-                threshold = self.thresholds['label_match_threshold'] if r_sp >= r_ns else self.thresholds['label_match_nospace_threshold']
+                threshold = lev_sp if r_sp >= r_ns else lev_ns
                 if r >= threshold:
+                    cand = (var['label'], w, r)
                     if best is None or r > best[2] or (r == best[2] and w > best[1]):
-                        best = (var['label'], w, r)
+                        best = cand
+
         return best
 
+
     def detect_labels_and_values(self, tokens: List[Dict[str, str]], regex_out: Dict[str, Any]) -> Dict[str, Any]:
-        """Segment the token stream into (label → raw value) pairs for later normalization.
+        """Segment tokens into (label → raw value) pairs using repo-guided label detection.
+
+        Walks the token stream, uses `search_refs` to find labels, then captures a small,
+        right-hand value window (stopping early if the next tokens look like a new label).
+        Real scans often have missing colons, glued tokens, or broken labels; matching via
+        `search_refs` is more reliable than static alias lists and reduces hand tuning.
 
         Args:
-            tokens (List[Dict[str, str]]): Token stream.
-            regex_out (Dict[str, Any]): Early regex hits to avoid mislabeling numeric spans.
+            tokens:    Token stream as produced by `tokenize_lines` (dicts with 'norm').
+            regex_out: Early regex hits (NIK/dates/RT-RW) used to avoid mislabeling numeric spans.
 
         Returns:
-            Dict[str, Any]: label_key → {value, confidence, source, evidence}
+            Dict[label_key] -> {'value','confidence','source','evidence'} where label_key
+            is the snake_case version of the canonical field (e.g., 'jenis_kelamin').
         """
         out: Dict[str, Any] = {}
         i = 0
         n = len(tokens)
 
+        # Prepare stop keys (canonicalized) to cut value windows early
+        stop_names = set(self.field_labels)
+        if self.refs:
+            # Prefer repo field names (more authoritative)
+            stop_names = set(self.refs.get_refs())
+        stop_keys = {self._key(name) for name in stop_names}
+        # Also treat RT/RW markers as hard stops
+        stop_keys.update({self._key(x) for x in ("RT", "RW", "RTRW")})
+
         def looks_like_label_at(k: int) -> bool:
-            lab = self._is_label_at(tokens, k)
-            return (lab is not None and lab[2] >= self.thresholds['label_stop_threshold'])
+            hit = self._is_label_at(tokens, k)
+            if not hit:
+                return False
+            # accept lower bar for "stop" than for "start"
+            return hit[2] >= float(self.thresholds.get('label_stop_threshold', 0.66))
+
+        def is_hard_stop(tok_norm: str) -> bool:
+            return self._key(tok_norm) in stop_keys
+
+        max_val_tokens = int(self.thresholds.get('max_value_tokens', 6))
 
         while i < n:
             lab = self._is_label_at(tokens, i)
             if lab:
-                label_name, span, ratio = lab
-                val_tokens = []
+                label_name, span, score = lab  # label_name is uppercase with spaces
                 j = i + span
-                max_val_tokens = self.thresholds['max_value_tokens']
+                val_tokens: List[str] = []
                 while j < n and len(val_tokens) < max_val_tokens:
                     if looks_like_label_at(j):
                         break
+                    if is_hard_stop(tokens[j]['norm']):
+                        break
                     val_tokens.append(tokens[j]['norm'])
                     j += 1
+
                 value_text = " ".join(val_tokens).strip()
-                key = label_name.lower().replace(' ', '_')
                 if value_text:
+                    key = label_name.lower().replace(' ', '_')
+                    # Confidence: base on search_refs score if used; cap for sanity
+                    conf = min(0.95, 0.60 + 0.25 * float(score))
                     out[key] = {
                         'value': value_text,
-                        'confidence': min(0.95, 0.6 + 0.25 * ratio),
+                        'confidence': conf,
                         'source': 'label_infer',
-                        'evidence': {'label': label_name, 'ratio': ratio, 'span': span}
+                        'evidence': {'label': label_name, 'ratio': float(score), 'span': span}
                     }
                 i = j
             else:
                 i += 1
+
         return out
+    
+    def _scan_enum(self, text: str, *, kind: str) -> Optional[str]:
+        """Extract a canonical enum value from a noisy value window (substring-aware).
+
+        Probes small 1–2 token combinations inside the captured value text to find
+        the closest canonical enum (gender/blood/religion/marital/job/citizenship).
+        Captured windows often contain extra tokens (e.g., "LAK1-LAK1 GolDrh A");
+        scanning short subspans fixes many borderline matches without lowering thresholds.
+
+        Args:
+            text: Raw captured value text (noisy).
+            kind: One of {'gender','blood','religion','marital','job','citizenship'}.
+
+        Returns:
+            Canonical enum display value (e.g., "PEREMPUAN", "AB", "ISLAM", "KAWIN", "WIRASWASTA", "WNI"),
+            or None if no candidate meets a minimal score.
+        """
+        if not text or not self.refs:
+            return None
+
+        raw = unicodedata.normalize('NFKC', text)
+        parts = [p for p in re.split(r'[\s,/|-]+', raw) if p]  # keep short tokens; hyphen splits too
+
+        def best(search_fn, cands: List[str], min_score: float) -> Optional[str]:
+            top_val, top_sc = None, 0.0
+            for cand in cands:
+                hits = search_fn(cand, k=1)
+                if hits:
+                    ref, sc = hits[0]
+                    if sc > top_sc:
+                        top_val, top_sc = ref.value, float(sc)
+            return top_val if top_sc >= min_score else None
+
+        if kind == "gender":
+            cands: List[str] = []
+            for i in range(len(parts)):
+                cands.append(parts[i])
+                if i + 1 < len(parts):
+                    cands.append(f"{parts[i]} {parts[i+1]}")
+                    cands.append(f"{parts[i]}-{parts[i+1]}")
+            return best(self.refs.search_genders, cands, 0.55)
+
+        if kind == "blood":
+            # Map common OCR confusions into plausible blood tokens
+            norm_parts = []
+            for p in parts:
+                p2 = p.upper().replace('0', 'O').replace('8', 'B')
+                norm_parts.append(p2)
+            # try single tokens first, then first token of the window
+            cands = norm_parts[:3]  # first few tokens usually carry it
+            return best(self.refs.search_blood_types, cands, 0.50)
+
+        if kind == "religion":
+            cands = []
+            for i in range(len(parts)):
+                cands.append(parts[i])
+                if i + 1 < len(parts):
+                    cands.append(f"{parts[i]} {parts[i+1]}")
+            return best(self.refs.search_religions, cands, 0.55)
+
+        if kind == "marital":
+            cands = []
+            for i in range(len(parts)):
+                cands.append(parts[i])
+                if i + 1 < len(parts):
+                    cands.append(f"{parts[i]} {parts[i+1]}")
+            return best(self.refs.search_marital_statuses, cands, 0.55)
+
+        if kind == "job":
+            cands = []
+            for i in range(len(parts)):
+                cands.append(parts[i])
+                if i + 1 < len(parts):
+                    cands.append(f"{parts[i]} {parts[i+1]}")
+            return best(self.refs.search_jobs, cands, 0.55)
+
+        if kind == "citizenship":
+            cands = []
+            for i in range(len(parts)):
+                cands.append(parts[i])
+            return best(self.refs.search_citizenships, cands, 0.50)
+
+        return None
+
+
 
     # -----------------------
     # Repositories: helpers
     # -----------------------
     @staticmethod
     def _pick_top(scored: List[Tuple[Any, float]], min_score: float) -> Optional[Any]:
-        """Choose top candidate above a threshold so we avoid weak matches.
-
-        Args:
-            scored (List[Tuple[Any, float]]): (item, score) sorted/unsorted.
-            min_score (float): Minimum acceptable score.
-
-        Returns:
-            Optional[Any]: The item if its score meets the bar; otherwise None.
-        """
+        """Choose top candidate above a threshold so we avoid weak matches."""
         if not scored:
             return None
         item, score = max(scored, key=lambda x: x[1])
         return item if score >= min_score else None
 
     # -----------------------
-    # Region normalization (via AdministrativeRegionsRepository.search_*)
+    # Region normalization (beam search)
     # -----------------------
     def _normalize_region_hierarchy(
         self,
         raw_regions: Dict[str, str],
         raw_text: Optional[str] = None
     ) -> Dict[str, Optional[str]]:
-        """Resolve Province → City/Kab → District → Village via repo search (context-aware).
+        """Resolve Province → City/Kab → District → Village using a small beam search.
+
+        Why:
+            Local best-at-each-level can pick inconsistent parents. A tiny beam (k≈2)
+            with consistency bonus yields robust, explainable paths without complexity.
 
         Args:
-            raw_regions (Dict[str, str]): Raw strings captured near labels (very noisy).
-            raw_text (Optional[str]): Whole text as a fallback hint.
+            raw_regions: Raw strings captured near labels (very noisy).
+            raw_text: Whole text as a fallback hint.
 
         Returns:
-            Dict[str, Optional[str]]: {'Provinsi', 'Kota', 'Kecamatan', 'Kel_Desa'} normalized names.
+            {'Provinsi','Kota','Kecamatan','Kel_Desa'} normalized names (or None).
         """
         if not self.regions:
-            # Pass-through if repo isn't available
             return {
                 "Provinsi": (raw_regions.get('provinsi') or None),
                 "Kota": (raw_regions.get('kota') or raw_regions.get('kabupaten') or None),
@@ -396,86 +673,101 @@ class OCRParser:
                 "Kel_Desa": (raw_regions.get('kelurahan') or raw_regions.get('kel_desa') or raw_regions.get('desa') or None),
             }
 
-        # Province
-        prov_raw = (raw_regions.get('provinsi') or '').strip()
-        prov_region = None
-        if prov_raw:
-            prov_hit = self.regions.search_provinces(prov_raw, k=1)
-            prov_region = self._pick_top(prov_hit, 0.58)  # type: ignore[arg-type]
+        dbg_paths: List[Tuple[Tuple[Optional[Region], Optional[Region], Optional[Region], Optional[Region]], float]] = []
 
-        # City/Kab (prefer within province)
-        kota_raw = (raw_regions.get('kota') or raw_regions.get('kabupaten') or '').strip()
-        city_region = None
-        if kota_raw:
-            if isinstance(prov_region, Region):
-                city_hit = self.regions.search_cities(kota_raw, province_id=prov_region.region_id, k=1)
-                city_region = self._pick_top(city_hit, 0.58)  # type: ignore[arg-type]
-            if not city_region:
-                city_hit = self.regions.search_cities(kota_raw, province_id=None, k=1)
-                city_region = self._pick_top(city_hit, 0.60)  # type: ignore[arg-type]
+        beam_k = int(self.thresholds.get('beam_k', 2))
 
-        # District (prefer within city)
-        kec_raw = (raw_regions.get('kecamatan') or '').strip()
-        dist_region = None
-        if kec_raw:
-            if isinstance(city_region, Region):
-                dist_hit = self.regions.search_districts(kec_raw, city_id=city_region.region_id, k=1)
-                dist_region = self._pick_top(dist_hit, 0.58)  # type: ignore[arg-type]
-            if not dist_region:
-                dist_hit = self.regions.search_districts(kec_raw, city_id=None, k=1)
-                dist_region = self._pick_top(dist_hit, 0.60)  # type: ignore[arg-type]
+        prov_q = (raw_regions.get('provinsi') or "").strip() or (raw_text or "")
+        prov_hits = self.regions.search_provinces(prov_q, k=max(beam_k, 2)) or []
+        prov_hits = prov_hits[:beam_k] if prov_hits else []
 
-        # Village (prefer within district)
-        kel_raw = (raw_regions.get('kelurahan') or raw_regions.get('kel_desa') or raw_regions.get('desa') or '').strip()
-        vill_region = None
-        if kel_raw:
-            if isinstance(dist_region, Region):
-                vill_hit = self.regions.search_villages(kel_raw, district_id=dist_region.region_id, k=1)
-                vill_region = self._pick_top(vill_hit, 0.60)  # type: ignore[arg-type]
-            if not vill_region:
-                vill_hit = self.regions.search_villages(kel_raw, district_id=None, k=1)
-                vill_region = self._pick_top(vill_hit, 0.62)  # type: ignore[arg-type]
+        # If nothing from explicit/whole text, leave as None path
+        if not prov_hits:
+            prov_hits = [(None, 0.0)]  # type: ignore
 
-        # Whole-text fallback (broad guesses: province/city/district/village by best scores)
-        if raw_text and (prov_region is None or city_region is None or dist_region is None or vill_region is None):
-            # Province fallback
-            if prov_region is None:
-                ph = self.regions.search_provinces(raw_text, k=1)
-                prov_region = self._pick_top(ph, 0.58)  # type: ignore[arg-type]
-            # City fallback
-            if city_region is None:
-                ch = self.regions.search_cities(raw_text, province_id=(prov_region.region_id if isinstance(prov_region, Region) else None), k=1)
-                city_region = self._pick_top(ch, 0.58)  # type: ignore[arg-type]
-            # District fallback
-            if dist_region is None:
-                dh = self.regions.search_districts(raw_text, city_id=(city_region.region_id if isinstance(city_region, Region) else None), k=1)
-                dist_region = self._pick_top(dh, 0.58)  # type: ignore[arg-type]
-            # Village fallback
-            if vill_region is None:
-                vh = self.regions.search_villages(raw_text, district_id=(dist_region.region_id if isinstance(dist_region, Region) else None), k=1)
-                vill_region = self._pick_top(vh, 0.60)  # type: ignore[arg-type]
+        kota_q = (raw_regions.get('kota') or raw_regions.get('kabupaten') or "").strip() or (raw_text or "")
+        kec_q = (raw_regions.get('kecamatan') or "").strip() or (raw_text or "")
+        kel_q = (raw_regions.get('kelurahan') or raw_regions.get('kel_desa') or raw_regions.get('desa') or "").strip() or (raw_text or "")
+
+        for prov, ps in prov_hits:
+            prov_id = prov.region_id if isinstance(prov, Region) else None
+
+            city_hits = self.regions.search_cities(kota_q, province_id=prov_id, k=max(beam_k, 2)) if kota_q else []
+            if not city_hits:
+                # try global city fallback (unscoped)
+                city_hits = self.regions.search_cities(kota_q or (raw_text or ""), province_id=None, k=max(beam_k, 2))
+            city_hits = city_hits[:beam_k] if city_hits else [(None, 0.0)]  # type: ignore
+
+            for city, cs in city_hits:
+                city_id = city.region_id if isinstance(city, Region) else None
+                dist_hits = self.regions.search_districts(kec_q, city_id=city_id, k=max(beam_k, 2)) if kec_q else []
+                if not dist_hits:
+                    dist_hits = self.regions.search_districts(kec_q or (raw_text or ""), city_id=None, k=max(beam_k, 2))
+                dist_hits = dist_hits[:beam_k] if dist_hits else [(None, 0.0)]  # type: ignore
+
+                for dist, ds in dist_hits:
+                    dist_id = dist.region_id if isinstance(dist, Region) else None
+                    vill_hits = self.regions.search_villages(kel_q, district_id=dist_id, k=max(beam_k, 2)) if kel_q else []
+                    if not vill_hits:
+                        vill_hits = self.regions.search_villages(kel_q or (raw_text or ""), district_id=None, k=max(beam_k, 2))
+                    vill_hits = vill_hits[:beam_k] if vill_hits else [(None, 0.0)]  # type: ignore
+
+                    for vill, vs in vill_hits:
+                        score = 0.0
+                        # base scores
+                        score += (ps or 0.0) + (cs or 0.0) + (ds or 0.0) + (vs or 0.0)
+                        # consistency bonuses
+                        bonus = 0.0
+                        if isinstance(prov, Region) and isinstance(city, Region) and city.parent_id == prov.region_id:
+                            bonus += 0.05
+                        if isinstance(city, Region) and isinstance(dist, Region) and dist.parent_id == city.region_id:
+                            bonus += 0.05
+                        if isinstance(dist, Region) and isinstance(vill, Region) and vill.parent_id == dist.region_id:
+                            bonus += 0.05
+                        score += bonus
+                        dbg_paths.append(((prov, city, dist, vill), score))
+
+        best = max(dbg_paths, key=lambda x: x[1]) if dbg_paths else (((None, None, None, None)), 0.0)
+        (prov_r, city_r, dist_r, vill_r), _ = best
 
         return {
-            "Provinsi": (prov_region.name_off if isinstance(prov_region, Region) else None),
-            "Kota": (city_region.name_off if isinstance(city_region, Region) else None),
-            "Kecamatan": (dist_region.name_off if isinstance(dist_region, Region) else None),
-            "Kel_Desa": (vill_region.name_off if isinstance(vill_region, Region) else None),
+            "Provinsi": (prov_r.name_off if isinstance(prov_r, Region) else None),
+            "Kota": (city_r.name_off if isinstance(city_r, Region) else None),
+            "Kecamatan": (dist_r.name_off if isinstance(dist_r, Region) else None),
+            "Kel_Desa": (vill_r.name_off if isinstance(vill_r, Region) else None),
         }
 
     # -----------------------
-    # Simple enums via KTPReferenceRepository
+    # Simple enums via KTPReferenceRepository (dual pass)
     # -----------------------
-    def _standardize_simple_fields(self, label_out: Dict[str, Any]) -> Dict[str, Optional[str]]:
-        """Normalize enumerated fields using KTPReferenceRepository so outputs match canonical vocab.
+    def _normalize_value_alias(self, text: str) -> str:
+        """Apply curated in-value aliases. Why: common OCR typos map to canonical vocab."""
+        t = re.sub(r'\s+', ' ', text).strip().upper()
+        return self.VALUE_ALIASES.get(t, t)
+
+    def _standardize_simple_fields(
+        self,
+        label_out: Dict[str, Any],
+        tokens_text: Optional[str] = None
+    ) -> Dict[str, Optional[str]]:
+        """Normalize enum-like fields to canonical KTP vocabulary.
+
+        Converts noisy captured values for gender, blood type, religion, marital status,
+        job, and citizenship into canonical forms using `KTPReferenceRepository`, with
+        a robust substring scan fallback.
+        Value windows often carry extra tokens or OCR noise. Trying the full window first,
+        then probing short subspans, yields high recall without loosening thresholds globally.
 
         Args:
-            label_out (Dict[str, Any]): Raw values captured after label detection.
+            label_out: Raw values captured after label detection.
+            tokens_text: Optional joined token text (not required here; accepted to match caller).
 
         Returns:
-            Dict[str, Optional[str]]: Canonical values for enum-like fields (or None when absent).
+            Canonical values (or None) for:
+            {'Jenis_Kelamin','Golongan_Darah','Agama','Status_Perkawinan','Pekerjaan','Kewarganegaraan'}.
         """
+        # Fallback (no refs): minimal uppercase pass-through
         if not self.refs:
-            # Fallback: uppercase pass-through for minimal disruption
             def up(x: str) -> str: return re.sub(r'\s+', ' ', x).strip().upper()
             return {
                 "Jenis_Kelamin": up(label_out.get('jenis_kelamin', {}).get('value', '')) or None,
@@ -491,29 +783,41 @@ class OCRParser:
             return pick.value if isinstance(pick, Ref) else None
 
         # Jenis Kelamin
-        jk_raw = (label_out.get('jenis_kelamin', {}) or {}).get('value', '')
-        jk = top_val(self.refs.search_genders(jk_raw, k=3), 0.66) if jk_raw else None
+        jk_win = (label_out.get('jenis_kelamin', {}) or {}).get('value', '')
+        jk = top_val(self.refs.search_genders(jk_win, k=3), 0.60) if jk_win else None
+        if not jk and jk_win:
+            jk = self._scan_enum(jk_win, kind="gender")
 
-        # Golongan Darah (often contains extra words; keep last token heuristic)
-        gd_raw_all = (label_out.get('golongan_darah', {}) or {}).get('value', '')
-        gd_token = gd_raw_all.split()[-1] if gd_raw_all else ''
-        gd = top_val(self.refs.search_blood_types(gd_token or gd_raw_all, k=3), 0.60) if (gd_token or gd_raw_all) else None
+        # Golongan Darah
+        gd_win_all = (label_out.get('golongan_darah', {}) or {}).get('value', '')
+        gd_token = gd_win_all.split()[-1] if gd_win_all else ''
+        gd = top_val(self.refs.search_blood_types(gd_token or gd_win_all, k=3), 0.55) if (gd_token or gd_win_all) else None
+        if not gd and gd_win_all:
+            gd = self._scan_enum(gd_win_all, kind="blood")
 
         # Agama
-        ag_raw = (label_out.get('agama', {}) or {}).get('value', '')
-        ag = top_val(self.refs.search_religions(ag_raw, k=5), 0.60) if ag_raw else None
+        ag_win = (label_out.get('agama', {}) or {}).get('value', '')
+        ag = top_val(self.refs.search_religions(ag_win, k=5), 0.55) if ag_win else None
+        if not ag and ag_win:
+            ag = self._scan_enum(ag_win, kind="religion")
 
         # Status Perkawinan
-        sp_raw = (label_out.get('status_perkawinan', {}) or {}).get('value', '')
-        sp = top_val(self.refs.search_marital_statuses(sp_raw, k=5), 0.60) if sp_raw else None
+        sp_win = (label_out.get('status_perkawinan', {}) or {}).get('value', '')
+        sp = top_val(self.refs.search_marital_statuses(sp_win, k=5), 0.55) if sp_win else None
+        if not sp and sp_win:
+            sp = self._scan_enum(sp_win, kind="marital")
 
         # Pekerjaan
-        pk_raw = (label_out.get('pekerjaan', {}) or {}).get('value', '')
-        pk = top_val(self.refs.search_jobs(pk_raw, k=5), 0.60) if pk_raw else None
+        pk_win = (label_out.get('pekerjaan', {}) or {}).get('value', '')
+        pk = top_val(self.refs.search_jobs(pk_win, k=5), 0.55) if pk_win else None
+        if not pk and pk_win:
+            pk = self._scan_enum(pk_win, kind="job")
 
         # Kewarganegaraan
-        kw_raw = (label_out.get('kewarganegaraan') or label_out.get('kewarganegaran') or {}).get('value', '')
-        kw = top_val(self.refs.search_citizenships(kw_raw, k=3), 0.60) if kw_raw else None
+        kw_win = (label_out.get('kewarganegaraan') or label_out.get('kewarganegaran') or {}).get('value', '')
+        kw = top_val(self.refs.search_citizenships(kw_win, k=3), 0.55) if kw_win else None
+        if not kw and kw_win:
+            kw = self._scan_enum(kw_win, kind="citizenship")
 
         return {
             "Jenis_Kelamin": jk,
@@ -531,11 +835,8 @@ class OCRParser:
     def _clean_person_text(text: str) -> str:
         """Tidy names/places so casing and glued letters look human-readable.
 
-        Args:
-            text (str): Raw noisy string.
-
-        Returns:
-            str: Cleaned display string with sensible capitalization.
+        Why:
+            Names are often split into single letters or have OCR digit bleed; this recovers readability.
         """
         def merge_fragments(t: str) -> str:
             parts = t.split()
@@ -566,46 +867,85 @@ class OCRParser:
 
     @staticmethod
     def _clean_address_text(text: str) -> str:
-        """Normalize address shapes; keep abbreviations and split letters/digits.
+        """Normalize address strings while preserving meaningful digits.
+
+        What:
+            Tidies spacing, standardizes common abbreviations (e.g., 'JL.'), and
+            separates letter/digit runs for readability.
+
+        Why:
+            Previous version converted digits → letters (e.g., '14' → 'IA'), which corrupts
+            house numbers/RT-RW. Addresses frequently include numbers that must be kept verbatim.
 
         Args:
-            text (str): Raw address string.
+            text: Raw address string (noisy OCR).
 
         Returns:
-            str: Uppercase cleaned address without RT/RW tails.
+            Uppercase cleaned address without altering digits.
         """
-        t = text.translate(OCRParser.REVERSE_OCR_MAP)
+        if not text:
+            return text
+        # Keep digits intact; only collapse whitespace and fix common abbreviations.
+        t = unicodedata.normalize('NFKC', text)
         t = re.sub(r'\s+', ' ', t).strip()
         t = re.sub(r'\bJL\b\.?', 'JL.', t, flags=re.IGNORECASE)
-        t = re.sub(r'([A-Z])(\d)', r'\1 \2', t)
+        # improve readability between letters and digits (e.g., "KAV12" → "KAV 12")
+        t = re.sub(r'([A-Za-z])(\d)', r'\1 \2', t)
+        t = re.sub(r'(\d)([A-Za-z])', r'\1 \2', t)
         return t.upper()
 
+
     @staticmethod
-    def _strip_rt_rw_from_alamat(alamat: str) -> str:
-        """Remove trailing RT/RW fragments that belong to a dedicated field.
+    def _strip_rt_rw_from_alamat(alamat: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """Remove explicit RT/RW fragments from address and return (clean, rt, rw).
+
+        Strips **explicitly marked** RT/RW segments only (e.g., 'RT 007', 'RW 008', 'RTRW 007008').
+        Does **not** treat generic 'NN/NN' house numbers as RT/RW to avoid false positives.
+        Addresses often contain slashes in house numbers (e.g., '45/12'); parsing those as RT/RW
+        leads to wrong output. We only honor clear markers.
 
         Args:
-            alamat (str): Candidate full address.
+            alamat: Candidate full address (noisy).
 
         Returns:
-            str: Address without RT/RW suffixes.
+            (clean_address, rt, rw) where rt/rw are digit strings (no zero-padding) or None.
         """
         if not alamat:
-            return alamat
+            return alamat, None, None
+
         t = alamat
-        t = re.sub(r'(?:\s|\b)(\d{3})[\/ ](\d{3})\s*$', '', t)
-        t = re.sub(r'(?:\s|\b)RT\W*\d{1,3}\s*$', '', t, flags=re.IGNORECASE)
-        t = re.sub(r'(?:\s|\b)RW\W*\d{1,3}\s*$', '', t, flags=re.IGNORECASE)
-        t = re.sub(r'(?:\s|\b)RTRW\W*\d{6}\s*$', '', t, flags=re.IGNORECASE)
-        return t.strip()
+
+        # Explicit RTRW 6 digits
+        m_rtrw = re.search(r'\bRTRW\W*0*(\d{3})0*(\d{3})\b', t, re.IGNORECASE)
+        rt, rw = (m_rtrw.group(1), m_rtrw.group(2)) if m_rtrw else (None, None)
+        if m_rtrw:
+            t = re.sub(r'\bRTRW\W*\d{6}\b', '', t, flags=re.IGNORECASE)
+
+        # Explicit RT / RW markers (prefer explicit over generic)
+        m_rt = re.search(r'\bRT\W*0*(\d{1,3})\b', t, re.IGNORECASE)
+        m_rw = re.search(r'\bRW\W*0*(\d{1,3})\b', t, re.IGNORECASE)
+        if m_rt:
+            rt = rt or m_rt.group(1)
+            t = re.sub(r'\bRT\W*\d{1,3}\b', '', t, flags=re.IGNORECASE)
+        if m_rw:
+            rw = rw or m_rw.group(1)
+            t = re.sub(r'\bRW\W*\d{1,3}\b', '', t, flags=re.IGNORECASE)
+
+        # Clean leftover spaces
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t, rt, rw
+
 
     @staticmethod
     def _fmt_rt_rw(rt: Optional[str], rw: Optional[str]) -> Optional[str]:
         """Format RT/RW in 'RRR/WWW' or None when missing, preserving numeric intent."""
         if not rt and not rw:
             return None
-        rt3 = f"{int(rt):03d}" if rt and rt.isdigit() else (rt or "")
-        rw3 = f"{int(rw):03d}" if rw and rw.isdigit() else (rw or "")
+        def pad(x: Optional[str]) -> str:
+            if x and x.isdigit():
+                return f"{int(x):03d}"
+            return x or ""
+        rt3, rw3 = pad(rt), pad(rw)
         if rt3 and rw3:
             return f"{rt3}/{rw3}"
         return rt3 or rw3 or None
@@ -629,40 +969,37 @@ class OCRParser:
     ) -> Optional[str]:
         """Assemble 'Tempat, DD-MM-YYYY' from combined/separate cues.
 
-        Args:
-            label_out (Dict[str, Any]): Detected label values.
-            tokens_joined (str): Normalized joined tokens.
-            all_dates (List[str]): Candidate dates found by regex.
-            raw_text (Optional[str]): Raw-ish text as a final fallback.
+        Why:
+            Users expect a compact, human-readable field; TTL is a common composite on KTP.
 
         Returns:
-            Optional[str]: 'PLACE, DD-MM-YYYY' or None.
+            'PLACE, DD-MM-YYYY' or None.
         """
-        # 1) direct combined label
+        # direct combined label
         comb = label_out.get('tempat_tgl_lahir', {}).get('value')
         if comb:
             m = re.search(r'([0-3]?\d[-/ ][0-1]?\d[-/ ][12]?\d{2,3})', comb)
             if m:
                 place = comb[:m.start()].strip()
-                date = m.group(1).replace(' ', '-')
+                date = m.group(1).replace(' ', '-').replace('/', '-')
                 place = self._clean_person_text(place).upper()
                 return f"{place}, {date}"
             if all_dates:
                 place = self._clean_person_text(comb).upper()
-                return f"{place}, {all_dates[0]}"
+                return f"{place}, {self._pick_best_date(all_dates) or all_dates[0]}"
 
-        # 2) separate labels
+        # separate labels
         place = label_out.get('tempat_lahir', {}).get('value')
         date1 = (label_out.get('tanggal_lahir') or {}).get('value') or (label_out.get('tgl_lahir') or {}).get('value')
         if place and date1:
             place = self._clean_person_text(place).upper()
-            return f"{place}, {date1.replace(' ', '-')}"
+            return f"{place}, {date1.replace(' ', '-').replace('/', '-')}"
 
         if place and all_dates:
             place = self._clean_person_text(place).upper()
-            return f"{place}, {all_dates[0]}"
+            return f"{place}, {self._pick_best_date(all_dates) or all_dates[0]}"
 
-        # 3) raw_text heuristic
+        # raw_text fallback
         if raw_text and all_dates:
             m = re.search(r'([0-3]?\d[-/ ][0-1]?\d[-/ ][12]?\d{2,3})', raw_text)
             if m:
@@ -670,30 +1007,54 @@ class OCRParser:
                 cand = " ".join(left[-3:]) if left else ""
                 if cand:
                     cand = self._clean_person_text(cand).upper()
-                    return f"{cand}, {all_dates[0]}"
+                    return f"{cand}, {self._pick_best_date(all_dates) or all_dates[0]}"
         return None
 
-    def _guess_kota_terbit(self, tokens_text: str, prov_region_name: Optional[str]) -> Optional[str]:
-        """Guess 'Kota_Terbit' from trailing tokens using region search for context.
+    def _guess_kota_terbit(
+        self,
+        tokens_text: str,
+        prov_region_name: Optional[str],
+        label_out: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """Guess 'Kota_Terbit' using explicit label first, then tail-of-text fallback.
+
+        If the OCR captured an explicit 'Kota Terbit' value, normalize that via city search.
+        Otherwise, infer from the trailing tokens of the whole text, constrained by province.
+        Issuing city/regency is often printed near the bottom; explicit capture wins,
+        but a scoped fallback recovers many cases with missing labels.
 
         Args:
-            tokens_text (str): Normalized joined tokens (tail examined).
-            prov_region_name (Optional[str]): Province name to scope city search.
+            tokens_text: Full normalized token text (joined with spaces).
+            prov_region_name: Province name to scope city search (improves precision).
+            label_out: Optional label capture dict to look for 'kota_terbit'.
 
         Returns:
-            Optional[str]: Best-guess issuing city/regency name.
+            Canonical city/regency name or None.
         """
         if not self.regions:
             return None
-        tail = " ".join(tokens_text.split()[-6:])
-        province_id = None
+
+        # Province scope → region_id
+        province_id: Optional[str] = None
         if prov_region_name:
-            # map province name → search top1 → get region_id context
             ph = self.regions.search_provinces(prov_region_name, k=1)
             top_prov = self._pick_top(ph, 0.58)  # type: ignore[arg-type]
             if isinstance(top_prov, Region):
                 province_id = top_prov.region_id
 
+        # 1) Explicit label if present
+        city_raw = None
+        if label_out:
+            city_raw = (label_out.get('kota_terbit') or {}).get('value')
+
+        if city_raw:
+            hits = self.regions.search_cities(city_raw, province_id=province_id, k=1)
+            best = self._pick_top(hits, 0.58)  # type: ignore[arg-type]
+            if isinstance(best, Region):
+                return best.name_off
+
+        # 2) Fallback: scan tail tokens
+        tail = " ".join(tokens_text.split()[-8:])
         hits = self.regions.search_cities(tail, province_id=province_id, k=1)
         best = self._pick_top(hits, 0.58)  # type: ignore[arg-type]
         return best.name_off if isinstance(best, Region) else None
@@ -708,20 +1069,21 @@ class OCRParser:
         label_out: Dict[str, Any],
         raw_text: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Build the final KTP dict by merging regex, label segmentation, and repo normalizations.
+        """Assemble the final KTP JSON by merging regex hits, label windows, and repo-normalization.
 
-        Args:
-            tokens (List[Dict[str, str]]): Normalized token stream.
-            regex_out (Dict[str, Any]): Regex extraction results (NIK/dates/RT-RW).
-            label_out (Dict[str, Any]): Raw label->value segmentation results.
-            raw_text (Optional[str]): Raw-ish text as a fallback hint.
+        What:
+            Consolidates deterministic regex fields (NIK/dates/RT-RW), repo-backed enums,
+            and hierarchical region resolution into a stable output schema.
+
+        Why:
+            Keeps downstream consumers simple—one normalized, minimal payload per record.
 
         Returns:
-            Dict[str, Any]: Final standardized KTP payload keyed by your schema.
+            Final KTP payload keyed by your schema (strings or None).
         """
         joined_norm = " ".join(t['norm'] for t in tokens)
 
-        # 1) Regions (raw capture from labels)
+        # 1) Regions (raw capture from labels) → normalization
         raw_regions = {
             'provinsi': (label_out.get('provinsi') or {}).get('value'),
             'kota': (label_out.get('kota') or {}).get('value'),
@@ -731,10 +1093,13 @@ class OCRParser:
             'kel_desa': (label_out.get('kel_desa') or {}).get('value'),
             'desa': (label_out.get('desa') or {}).get('value'),
         }
-        regions_std = self._normalize_region_hierarchy({k: (v or "") for k, v in raw_regions.items()}, raw_text=raw_text)
+        regions_std = self._normalize_region_hierarchy(
+            {k: (v or "") for k, v in raw_regions.items()},
+            raw_text=raw_text
+        )
 
-        # 2) Simple fields via refs
-        simple = self._standardize_simple_fields(label_out)
+        # 2) Simple fields via refs (dual pass with substring fallback)
+        simple = self._standardize_simple_fields(label_out, joined_norm)
 
         # 3) NIK
         nik = (regex_out.get('nik') or {}).get('value')
@@ -743,15 +1108,16 @@ class OCRParser:
         nama_raw = (label_out.get('nama') or {}).get('value', '')
         nama = self._clean_person_text(nama_raw) if nama_raw else None
 
-        # 5) Alamat (strip RT/RW tail)
+        # 5) Alamat (strip explicit RT/RW from address and recycle if missing)
         alamat_raw = (label_out.get('alamat') or {}).get('value', '')
         alamat = self._clean_address_text(alamat_raw) if alamat_raw else None
+        rt_from_addr, rw_from_addr = None, None
         if alamat:
-            alamat = self._strip_rt_rw_from_alamat(alamat)
+            alamat, rt_from_addr, rw_from_addr = self._strip_rt_rw_from_alamat(alamat)
 
-        # 6) RT/RW
-        rt_val = (regex_out.get('rt') or {}).get('value')
-        rw_val = (regex_out.get('rw') or {}).get('value')
+        # 6) RT/RW (regex or from explicit markers in address)
+        rt_val = (regex_out.get('rt') or {}).get('value') or rt_from_addr
+        rw_val = (regex_out.get('rw') or {}).get('value') or rw_from_addr
         rt_rw = self._fmt_rt_rw(rt_val, rw_val)
 
         # 7) Tempat, Tgl Lahir
@@ -763,13 +1129,13 @@ class OCRParser:
         berlaku = None
         if berlaku_raw:
             in_dates = re.findall(r'[0-3]?\d[-/ ][0-1]?\d[-/ ][12]?\d{2,3}', berlaku_raw)
-            berlaku = (in_dates[0] if in_dates else berlaku_raw).replace(' ', '-')
+            berlaku = (in_dates[0] if in_dates else berlaku_raw).replace(' ', '-').replace('/', '-')
         elif dates:
             berlaku = dates[-1]
 
         # 9) Kota/Tanggal Terbit
-        kota_terbit = self._guess_kota_terbit(joined_norm, regions_std.get("Provinsi"))
-        tgl_terbit = dates[-1] if dates else None
+        kota_terbit = self._guess_kota_terbit(joined_norm, regions_std.get("Provinsi"), label_out)
+        tgl_terbit = (label_out.get('tanggal_terbit') or {}).get('value') or (dates[-1] if dates else None)
 
         final: Dict[str, Optional[str]] = {
             "Provinsi": regions_std.get("Provinsi"),
@@ -792,7 +1158,7 @@ class OCRParser:
             "Tanggal_Terbit": tgl_terbit
         }
 
-        # Final tidy (collapse spaces; empty to None)
+        # Final tidy
         def tidy(v: Optional[str]) -> Optional[str]:
             if v is None:
                 return None
@@ -804,17 +1170,21 @@ class OCRParser:
 
         return final
 
+
     # -----------------------
     # Public API
     # -----------------------
     def interpret(self, lines: List[str]) -> Dict[str, Any]:
         """End-to-end parse: tokenize → regex → label segment → repo-normalize → assembled dict.
 
+        Why:
+            Produce a consistent KTP payload from chaotic OCR input with deterministic rules.
+
         Args:
-            lines (List[str]): Raw OCR lines.
+            lines: Raw OCR lines.
 
         Returns:
-            Dict[str, Any]: Standardized KTP payload with best-effort normalized values.
+            Standardized KTP payload with best-effort normalized values (see top-level schema).
         """
         tokens = self.tokenize_lines(lines)
         joined_norm = " ".join(tok['norm'] for tok in tokens)
@@ -841,7 +1211,7 @@ if __name__ == "__main__":
     except Exception as e:
         logger.warning("Failed loading KTPReferenceRepository: %s", e)
 
-    # Sample OCR rows
+    # Sample OCR rows (kept from your original for sanity checks)
     dataset = [
         ["PROV1NSIDKI", "JAKARTA", "JAKARTABAR4T", "NIK 3171234567890123", "Nama M1RA SETIWAN",
          "TempatTgLLahr JAKRT4 18-02-1986", "JensKelmnn PERMPUAN GolDrh 8", "Almat JL PASTICEPATA7/66",
@@ -868,118 +1238,8 @@ if __name__ == "__main__":
          "Agm lSLM","StusPrkawnan", "BELUMKAWIN","SWASTA","Kewarganegaran WNI","BerlakHngga 12-12-2016"]
     ]
 
-    parser = OCRParser(regions=regions_repo, refs=refs_repo)
+    parser = OCRParser(regions=regions_repo, refs=refs_repo, debug=True)
     for rec in dataset:
         parsed = parser.interpret(rec)
         print(json.dumps(parsed, indent=2, ensure_ascii=False))
         print('-' * 80)
-
-
-
-# Design notes — OCRParser hardening (no AI/ML, purely deterministic)
-
-# Goal:
-#     Extract KTP fields reliably from chaotic OCR text: missing labels, split/merged tokens,
-#     and heavy OCR noise. This parser stays rule-based (string ops + SQLite-backed repos).
-
-# 1) Preprocessing & tokenization
-#     • Dual views:
-#         - Keep original line groups for weak positional cues.
-#         - Build a flattened token stream (one token per array item) and a character stream.
-#       Why: handles ["PROVINSI","DKI","JAKARTA"] and "PROV1NSIDKI" equally well.
-#     • Super-tokens:
-#         - Synthesize bigrams/trigrams of adjacent tokens (e.g., "PROVINSI DKI").
-#       Why: covers split labels/values without guessing boundaries.
-#     • Token repair variants:
-#         - For each token, precompute variants: nospace, dehyphenated, digits→letters and letters→digits,
-#           plus short-edit neighbors (distance ≤ 1–2).
-#       Why: catches "PROV1NSIDKI" ↔ "PROVINSI DKI" and "LAK1-LAK1" ↔ "LAKI-LAKI".
-
-# 2) Label detection (robust to missing/split/merged)
-#     • Trie + sliding window over flattened tokens AND super-tokens.
-#       Use nospace and spaced forms for all label variants (defaults + fields from refs repo).
-#     • Consider ":", ".", "—", and newlines as weak separators but not required.
-#       Why: many scans omit colons; we still want a value window to the right/next.
-
-# 3) Value capture when labels are broken or missing
-#     • Proximity pairing:
-#         - Given a detected label, capture the closest rightward value tokens (bounded window).
-#         - Allow look-ahead across line breaks for split labels/values.
-#     • Label-free guessing for enums:
-#         - If a label is missing, scan globally through KTPReferenceRepository and take strong hits
-#           (score ≥ τ) unless already consumed by another field.
-
-# 4) Regions — let hierarchy do the work
-#     • Top-down beam search:
-#         1) Take top-2/3 provinces from search.
-#         2) For each province, search cities scoped under it.
-#         3) For each city, search districts; then villages.
-#         4) Final path score = (local score per level) × (hierarchy consistency bonus).
-#       Why: if one level is noisy, parent-child consistency rescues alignment.
-#     • Whole-text backstop:
-#         - If any level missing, also search with the entire flattened text; blend global and local scores.
-#     • Conflict repair:
-#         - If city ∉ province:
-#             (a) switch to the city's true province if city score ≫ province score; OR
-#             (b) keep province and re-search city constrained to it.
-
-# 5) Enumerations via refs (when labels/values are split/absent)
-#     • Dual pass:
-#         - Label-guided pass: restrict to the next N tokens.
-#         - Global pass: if nothing strong found, search the full stream via refs repo,
-#           pick top ≥ τ (and not already used by another field).
-
-# 6) Deterministic extracts with REGEX (preferred for non-repo fields)
-#     • Use regular expressions for strongly structured fields not powered by repos:
-#         - NIK: 16 digits, accept O/I/| as 0/1; normalize and clamp to first 16.
-#         - Date: DD[-/ ]MM[-/ ]YYYY or DD[-/ ]MM[-/ ]YY; allow O/I→0/1; normalize spaces→'-'.
-#         - RT/RW: explicit "RT ddd" / "RW ddd", or combined 6 digits → "ddd/ddd".
-#       Rationale: regex is concise, fast, and accurate for these constrained formats.
-#       (Optional fallback: tiny finite-state scanners if you ever want regex-free builds.)
-
-# 7) Ambiguity & confidence
-#     • Confidence by source:
-#         - regex extract > label-guided repo match > global repo match.
-#     • Cross-field consistency boosts:
-#         - +bonus if city∈province, district∈city, village∈district; -penalty on mismatches.
-#     • Keep alternates internally; emit top pick with confidence (optionally expose suggestions in UI).
-
-# 8) Performance
-#     • Aggressive caching:
-#         - LRU for normalized tokens, nospace forms, trigrams, and repeated repo queries.
-#         - Deduplicate repeated tokens/phrases before searching repos.
-#     • Smaller candidate sets:
-#         - Use SQLite prefix + trigram LIKE prefilters; target ≤ 200 candidates/query; ≤ 3 queries/level.
-#         - For enums, even tighter: ≤ 50 candidates before scoring.
-#     • Fast distances:
-#         - Use python-Levenshtein; precompute nospace(query) once for batch scoring.
-#     • Early exits:
-#         - If a field is high-confidence, skip global searches.
-#     • Parallelize independent searches:
-#         - Provinces/enums can run in a thread pool; WAL mode handles concurrent reads.
-
-# 9) Real-scan QoL
-#     • If OCR provides bounding boxes: prefer same-line-right of label, then next line (big accuracy win).
-#     • Alias dictionary for frequent confusions:
-#         - e.g., "PERMPUAN"→"PEREMPUAN", "KAWlN"→"KAWIN", "WNl"→"WNI", "AGM"→"AGAMA".
-#     • Domain heuristics:
-#         - NIK prefix hints province/city; bias the beam.
-#         - Strip RT/RW embedded in Alamat and reuse if RT/RW fields are missing.
-
-# 10) Ingestion shape
-#     • Yes: split into atomic strings per item AND also keep a re-joined variant.
-#       - Atomic items help super-token recombination.
-#       - Original line grouping keeps weak positional cues.
-
-# 11) Explicit edge cases
-#     • Repeated labels / out of order → keep the best-confidence (or latest with higher confidence).
-#     • Value-before-label → allow a short look-back window.
-#     • Two values glued → accept '/', '-', and nospace merges (e.g., LAK1-LAK1, RTRW007008).
-#     • District present but city/province missing → resolve district globally, infer its parents.
-
-# 12) Practical thresholds (starting points)
-#     • label_match_threshold ≈ 0.80; label_nospace_threshold ≈ 0.74
-#     • enums: accept ≥ 0.60 (global), ≥ 0.66 (label-window)
-#     • regions: province ≥ 0.58; city ≥ 0.60; district ≥ 0.60; village ≥ 0.62
-#     • hierarchy bonus +0.05 per valid parent link; mismatch penalty −0.08
-
