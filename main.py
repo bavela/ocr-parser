@@ -4,7 +4,7 @@ filepath: main.py
 
 Refined OCRParser focused on robust field-label detection and safer OCR normalization.
 Now integrates:
-  - AdministrativeRegionsRepository for Province → City/Kab → District → Village normalization (beam + mention filter).
+  - AdministrativeRegionsRepository for Province -> City/Kab -> District -> Village normalization (beam + mention filter).
   - KTPReferenceRepository for enumerated KTP fields (gender, religion, etc.) using dual-pass search:
       (1) label-window first, (2) global fallback scan over the whole token stream.
   - Month-name and numeric date parsing; RT/RW detection in multiple shapes (RT 007 / RW 008 / "007/008").
@@ -185,7 +185,7 @@ class OCRParser:
         letters = sum(ch.isalpha() for ch in t)
         digits = sum(ch.isdigit() for ch in t)
 
-        # numeric-dominant → fix O/I/| to digits; alpha-dominant → fix digits to letters
+        # numeric-dominant -> fix O/I/| to digits; alpha-dominant -> fix digits to letters
         if digits >= max(1, len(t) // 2):
             t = t.translate(self.NUMERIC_OCR_MAP)
         else:
@@ -203,7 +203,7 @@ class OCRParser:
 
         Why:
             Using normalized tokens for label detection but raw tokens for values prevents
-            digit→letter artifacts that break addresses and enums.
+            digit->letter artifacts that break addresses and enums.
         """
         tokens: List[Dict[str, str]] = []
         for line in lines:
@@ -390,16 +390,8 @@ class OCRParser:
         return best
 
     def detect_labels_and_values(self, tokens: List[Dict[str, str]], regex_out: Dict[str, Any]) -> Dict[str, Any]:
-        """Segment tokens into (label → raw value) pairs using repo-guided label detection.
-
-        What:
-            Walks the token stream, finds labels, then captures a right-hand value window
-            (stopping early if the next tokens look like a new label). Values are joined
-            from **raw** tokens to preserve digits.
-
-        Why:
-            Many scans omit colons or glue tokens; using `search_refs` beats brittle alias lists.
-        """
+        """Segment tokens into (label -> raw value) pairs using repo-guided label detection,
+        with stricter 'next-label' checks and small fallbacks to avoid empty value windows."""
         out: Dict[str, Any] = {}
         i = 0
         n = len(tokens)
@@ -407,42 +399,79 @@ class OCRParser:
         stop_keys = self._field_keys()
         stop_keys.update({self._key(x) for x in ("RT", "RW", "RTRW")})
 
-        def looks_like_label_at(k: int) -> bool:
-            hit = self._is_label_at(tokens, k)
-            return bool(hit and hit[2] >= float(self.thresholds.get('label_stop_threshold', 0.66)))
-
         def is_hard_stop(tok_norm: str) -> bool:
             return self._key(tok_norm) in stop_keys
 
+        base_stop = float(self.thresholds.get('label_stop_threshold', 0.66))
         max_val_tokens = int(self.thresholds.get('max_value_tokens', 10))
+        maxw = int(self.thresholds.get('max_label_window', 3))
+
+        def looks_like_label_at(k: int, *, current_label: Optional[str] = None) -> bool:
+            """Stricter early-stop: require stronger confidence for 1-token hits and ignore ultra-short tokens."""
+            hit = self._is_label_at(tokens, k)
+            if not hit:
+                return False
+            canon, span, score = hit
+            if current_label and canon == current_label:
+                return False
+            # tougher guard for single-token 'stops'
+            if span == 1:
+                # tiny tokens or low-confidence shouldn't stop a value window
+                if len(tokens[k]['norm']) <= 3:
+                    return False
+                if score < (base_stop + 0.12):
+                    return False
+            return score >= base_stop
 
         while i < n:
             lab = self._is_label_at(tokens, i)
-            if lab:
-                label_name, span, score = lab  # e.g., "JENIS KELAMIN"
-                j = i + span
-                val_raw_tokens: List[str] = []
-                while j < n and len(val_raw_tokens) < max_val_tokens:
-                    if looks_like_label_at(j):
-                        break
-                    if is_hard_stop(tokens[j]['norm']):
-                        break
-                    val_raw_tokens.append(tokens[j]['raw'])  # <-- RAW to preserve digits
-                    j += 1
-
-                value_text = " ".join(val_raw_tokens).strip()
-                if value_text:
-                    key = label_name.lower().replace(' ', '_')
-                    conf = min(0.95, 0.60 + 0.25 * float(score))
-                    out[key] = {
-                        'value': value_text,
-                        'confidence': conf,
-                        'source': 'label_infer',
-                        'evidence': {'label': label_name, 'ratio': float(score), 'span': span}
-                    }
-                i = j
-            else:
+            if not lab:
                 i += 1
+                continue
+
+            label_name, span, score = lab  # e.g., "JENIS KELAMIN"
+            j = i + span
+            val_raw_tokens: List[str] = []
+
+            # capture window
+            while j < n and len(val_raw_tokens) < max_val_tokens:
+                if looks_like_label_at(j, current_label=label_name):
+                    break
+                if is_hard_stop(tokens[j]['norm']):
+                    break
+                val_raw_tokens.append(tokens[j]['raw'])  # preserve digits
+                j += 1
+
+            # if empty (common with low stop thresholds), apply tiny, safe fallbacks
+            if not val_raw_tokens and j < n:
+                want = 4 if label_name == "NAMA" else 1
+                taken = 0
+                j2 = j
+                while j2 < n and taken < want:
+                    if looks_like_label_at(j2, current_label=label_name):
+                        break
+                    if is_hard_stop(tokens[j2]['norm']):
+                        break
+                    # For NAMA, ensure the token looks name-like (has letters)
+                    if label_name == "NAMA" and not any(ch.isalpha() for ch in tokens[j2]['raw']):
+                        break
+                    val_raw_tokens.append(tokens[j2]['raw'])
+                    taken += 1
+                    j2 += 1
+                j = j2
+
+            value_text = " ".join(val_raw_tokens).strip()
+            if value_text:
+                key = label_name.lower().replace(' ', '_')
+                conf = min(0.95, 0.60 + 0.25 * float(score))
+                out[key] = {
+                    'value': value_text,
+                    'confidence': conf,
+                    'source': 'label_infer',
+                    'evidence': {'label': label_name, 'ratio': float(score), 'span': span}
+                }
+
+            i = j
 
         return out
 
@@ -450,19 +479,11 @@ class OCRParser:
     # Enum extraction helpers
     # -----------------------
     def _scan_enum(self, text: str, *, kind: str) -> Optional[str]:
-        """Extract a canonical enum value from a noisy value window (substring-aware).
-
-        What:
-            Probes 1–2 token combinations inside a captured value to find the closest canonical
-            enum (gender/blood/religion/marital/job/citizenship).
-
-        Why:
-            Captured windows often contain extra tokens (e.g., "LAK1-LAK1 GolDrh A").
-            Subspan scanning fixes borderline matches without loosening thresholds.
-        """
+        """Extract a canonical enum value from a noisy value window (substring-aware)."""
         if not text or not self.refs:
             return None
 
+        import unicodedata, re
         raw = unicodedata.normalize('NFKC', text)
         parts = [p for p in re.split(r'[\s,/|-]+', raw) if p]
 
@@ -474,7 +495,8 @@ class OCRParser:
                     ref, sc = hits[0]
                     if sc > top_sc:
                         top_val, top_sc = ref.value, float(sc)
-            return top_val if top_sc >= min_score else None
+            # key change: allow greedy pick if enabled
+            return top_val if (self.greedy_pick or top_sc >= min_score) else None
 
         if kind == "gender":
             cands: List[str] = []
@@ -521,15 +543,7 @@ class OCRParser:
         return None
 
     def _global_enum_fallback(self, tokens_text: str) -> Dict[str, Optional[str]]:
-        """Search the whole token stream for enum values when label windows fail.
-
-        What:
-            Sliding 1–2 token windows across the entire text, feed candidates into the refs
-            searchers and accept the best hits above conservative thresholds.
-
-        Why:
-            OCR often drops labels entirely; a careful global pass recovers many fields.
-        """
+        """Search the whole token stream for enum values when label windows fail."""
         out: Dict[str, Optional[str]] = {
             "Jenis_Kelamin": None, "Golongan_Darah": None, "Agama": None,
             "Status_Perkawinan": None, "Pekerjaan": None, "Kewarganegaraan": None
@@ -537,18 +551,19 @@ class OCRParser:
         if not self.refs or not tokens_text:
             return out
 
+        import re
         toks = [t for t in re.split(r'\s+', tokens_text) if t]
+
         def scan(min_score: float, search_fn) -> Optional[str]:
             best_val, best_sc = None, 0.0
-            # size 1 and 2 windows
+            # size-1 and size-2 windows
             for i in range(len(toks)):
                 cand = toks[i]
-                for c in (cand,):
-                    hits = search_fn(c, k=1)
-                    if hits:
-                        ref, sc = hits[0]
-                        if sc > best_sc:
-                            best_val, best_sc = ref.value, float(sc)
+                hits = search_fn(cand, k=1)
+                if hits:
+                    ref, sc = hits[0]
+                    if sc > best_sc:
+                        best_val, best_sc = ref.value, float(sc)
                 if i + 1 < len(toks):
                     cand2 = f"{toks[i]} {toks[i+1]}"
                     hits2 = search_fn(cand2, k=1)
@@ -556,15 +571,17 @@ class OCRParser:
                         ref2, sc2 = hits2[0]
                         if sc2 > best_sc:
                             best_val, best_sc = ref2.value, float(sc2)
-            return best_val if best_sc >= min_score else None
+            # key change: allow greedy pick if enabled
+            return best_val if (self.greedy_pick or best_sc >= min_score) else None
 
-        out["Jenis_Kelamin"]   = scan(0.60, self.refs.search_genders)
-        out["Golongan_Darah"]  = scan(0.55, self.refs.search_blood_types)
-        out["Agama"]           = scan(0.55, self.refs.search_religions)
+        out["Jenis_Kelamin"]     = scan(0.60, self.refs.search_genders)
+        out["Golongan_Darah"]    = scan(0.55, self.refs.search_blood_types)
+        out["Agama"]             = scan(0.55, self.refs.search_religions)
         out["Status_Perkawinan"] = scan(0.55, self.refs.search_marital_statuses)
-        out["Pekerjaan"]       = scan(0.58, self.refs.search_jobs)
-        out["Kewarganegaraan"] = scan(0.55, self.refs.search_citizenships)
+        out["Pekerjaan"]         = scan(0.58, self.refs.search_jobs)
+        out["Kewarganegaraan"]   = scan(0.55, self.refs.search_citizenships)
         return out
+
 
     # -----------------------
     # Repo helpers
@@ -611,7 +628,7 @@ class OCRParser:
         raw_regions: Dict[str, str],
         raw_text: Optional[str] = None
     ) -> Dict[str, Optional[str]]:
-        """Resolve Province → City/Kab → District → Village using a small beam search + mention filter.
+        """Resolve Province -> City/Kab -> District -> Village using a small beam search + mention filter.
 
         Why:
             Local best-at-each-level can pick inconsistent parents; a tiny beam with a simple
@@ -628,7 +645,7 @@ class OCRParser:
         text_tokens = self._token_set(raw_text or "")
         beam_k = int(self.thresholds.get('beam_k', 2))
 
-        # Queries prefer explicit captured strings; no explicit → very cautious global use
+        # Queries prefer explicit captured strings; no explicit -> very cautious global use
         prov_q = (raw_regions.get('provinsi') or "").strip()
         kota_q = (raw_regions.get('kota') or raw_regions.get('kabupaten') or "").strip()
         kec_q = (raw_regions.get('kecamatan') or "").strip()
@@ -913,6 +930,58 @@ class OCRParser:
                     cand = self._clean_person_text(cand).upper()
                     return f"{cand}, {all_dates[0]}"
         return None
+    
+    def _fallback_name_from_tokens(self, tokens: List[Dict[str, str]]) -> Optional[str]:
+        """
+        Heuristic rescue for 'Nama' when the label window wasn't captured.
+        Finds the token 'NAMA' and grabs up to 4 following name-like tokens,
+        stopping at the next label/hard-stop.
+        """
+        if not tokens:
+            return None
+
+        n = len(tokens)
+        stop_keys = self._field_keys()
+        stop_keys.update({self._key(x) for x in ("RT", "RW", "RTRW")})
+        base_stop = float(self.thresholds.get('label_stop_threshold', 0.66))
+
+        def is_hard_stop(tok_norm: str) -> bool:
+            return self._key(tok_norm) in stop_keys
+
+        def looks_like_label_at(k: int) -> bool:
+            hit = self._is_label_at(tokens, k)
+            if not hit:
+                return False
+            _, span, score = hit
+            # demand a bit more confidence for single-token "stops"
+            if span == 1 and score < (base_stop + 0.12):
+                return False
+            return score >= base_stop
+
+        for i in range(n):
+            if tokens[i]['norm'] != 'NAMA':
+                continue
+            j = i + 1
+            picked: List[str] = []
+            while j < n and len(picked) < 4:
+                if looks_like_label_at(j) or is_hard_stop(tokens[j]['norm']):
+                    break
+                raw = tokens[j]['raw']
+                # must be name-ish: contain at least one letter; avoid pure numbers
+                if any(ch.isalpha() for ch in raw):
+                    picked.append(raw)
+                else:
+                    # stop if the very next token is non-namey (prevents scooping house numbers)
+                    if not picked:
+                        j += 1
+                        continue
+                    break
+                j += 1
+            if picked:
+                return " ".join(picked)
+
+        return None
+
 
     def _guess_kota_terbit(
         self,
@@ -924,7 +993,7 @@ class OCRParser:
         if not self.regions:
             return None
 
-        # Province scope → region_id
+        # Province scope -> region_id
         province_id: Optional[str] = None
         if prov_region_name:
             ph = self.regions.search_provinces(prov_region_name, k=1)
@@ -948,21 +1017,13 @@ class OCRParser:
     # Assembly to standard KTP JSON schema
     # -----------------------
     def assemble_ktp_json(
-        self,
-        tokens: List[Dict[str, str]],
-        regex_out: Dict[str, Any],
-        label_out: Dict[str, Any],
-        raw_text: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Assemble the final KTP JSON by merging regex hits, label windows, and repo-normalization.
-
-        What:
-            Consolidates deterministic regex fields (NIK/dates/RT-RW), repo-backed enums,
-            and hierarchical region resolution into a stable output schema.
-
-        Why:
-            Keeps downstream consumers simple—one normalized, minimal payload per record.
-        """
+    self,
+    tokens: List[Dict[str, str]],
+    regex_out: Dict[str, Any],
+    label_out: Dict[str, Any],
+    raw_text: Optional[str] = None
+) -> Dict[str, Any]:
+        """Assemble the final KTP JSON by merging regex hits, label windows, and repo-normalization."""
         joined_norm = " ".join(t['norm'] for t in tokens)
         joined_raw = " ".join(t['raw'] for t in tokens)
 
@@ -978,7 +1039,7 @@ class OCRParser:
         }
         regions_std = self._normalize_region_hierarchy(
             {k: (v or "") for k, v in raw_regions.items()},
-            raw_text=joined_norm  # keep normalized view for mention tokens
+            raw_text=joined_norm
         )
 
         # 2) Simple fields via refs (dual pass + global fallback)
@@ -987,8 +1048,12 @@ class OCRParser:
         # 3) NIK
         nik = (regex_out.get('nik') or {}).get('value')
 
-        # 4) Nama (use RAW-based capture, then clean)
+        # 4) Nama (prefer label capture; if missing/empty, use token-based fallback)
         nama_raw = (label_out.get('nama') or {}).get('value', '')
+        if not nama_raw:
+            guess = self._fallback_name_from_tokens(tokens)
+            if guess:
+                nama_raw = guess
         nama = self._clean_person_text(nama_raw) if nama_raw else None
 
         # 5) Alamat (strip explicit RT/RW from address and recycle if missing)
@@ -1057,7 +1122,7 @@ class OCRParser:
     # Public API
     # -----------------------
     def interpret(self, lines: List[str]) -> Dict[str, Any]:
-        """End-to-end parse: tokenize → regex → label segment → repo-normalize → assembled dict.
+        """End-to-end parse: tokenize -> regex -> label segment -> repo-normalize -> assembled dict.
 
         Why:
             Produce a consistent KTP payload from chaotic OCR input with deterministic rules.
