@@ -59,7 +59,7 @@ coverage.xml
 
 # OS files
 .DS_Store
-Thumbs.db
+*.db
 
 # Project-specific temp/output (uncomment if you use these)
 # data/
